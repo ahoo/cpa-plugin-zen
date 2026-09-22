@@ -133,9 +133,24 @@ func (p *sessionPool) report(id string, ok bool, cooldownSec int) {
 }
 
 // poolSessionHeader carries the sticky pool assignment from the
-// interceptor to the executor. Internal only: executors build their own
-// upstream headers and never forward it.
+// interceptor to the executor, and echoes the serving session back on
+// responses. Internal only: executors build their own upstream headers
+// and never forward it.
 const poolSessionHeader = "X-Zen-Pool-Session"
+
+// stampPoolSession records the pool session that served the request on the
+// response headers for observability (e2e stickiness assertions). It never
+// touches upstream-bound headers: executors build those separately.
+func stampPoolSession(headers http.Header, session string) http.Header {
+	if strings.TrimSpace(session) == "" {
+		return headers
+	}
+	if headers == nil {
+		headers = http.Header{}
+	}
+	headers.Set(poolSessionHeader, session)
+	return headers
+}
 
 // assign binds a downstream conversation identity to one pool session
 // (stable hash, forward probe past cooled/failed entries). Empty when the
@@ -1120,6 +1135,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 				return nil, nil, "", lastErr
 			}
 			e.sessions.report(s, true, 0)
+			stampPoolSession(headers, s)
 			return respBody, headers, strings.ToLower(strings.TrimSpace(entry.Endpoint)), nil
 		}
 		if attempts >= 8 {

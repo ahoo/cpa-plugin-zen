@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -567,5 +568,20 @@ func TestFallbackFloor(t *testing.T) {
 	def := parseConfig([]byte("paid:\n  api_keys:\n    - key: sk-x\n"))
 	if def.fallbackFloor() != 512 {
 		t.Fatalf("default floor = %d", def.fallbackFloor())
+	}
+}
+
+func TestStampPoolSessionEcho(t *testing.T) {
+	h := stampPoolSession(http.Header{}, "ses_abc")
+	if h.Get(poolSessionHeader) != "ses_abc" {
+		t.Fatalf("echo missing: %v", h)
+	}
+	h2 := stampPoolSession(nil, "ses_abc")
+	if h2.Get(poolSessionHeader) != "ses_abc" {
+		t.Fatal("nil map must be allocated")
+	}
+	h3 := stampPoolSession(http.Header{"X": []string{"1"}}, "")
+	if h3.Get(poolSessionHeader) != "" {
+		t.Fatal("empty session must not stamp")
 	}
 }
