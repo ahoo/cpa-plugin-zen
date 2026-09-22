@@ -591,3 +591,12 @@ func TestFallbackHeaderConst(t *testing.T) {
 		t.Fatalf("fallback marker renamed: %q", fallbackHeader)
 	}
 }
+
+func TestResponsesConverterTextDone(t *testing.T) {
+	c := newResponsesConverter()
+	line := []byte(`data: {"type":"response.output_text.done","item_id":"it1","output_index":0,"content_index":0,"text":"PONG"}`)
+	out := c.convertLine(line)
+	if len(out) == 0 || !bytes.Contains(out, []byte("PONG")) {
+		t.Fatalf("done event dropped: %q", out)
+	}
+}

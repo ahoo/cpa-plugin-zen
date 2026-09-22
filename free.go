@@ -574,6 +574,7 @@ func (c *responsesConverter) convertLine(line []byte) []byte {
 	var ev struct {
 		Type  string `json:"type"`
 		Delta string `json:"delta"`
+		Text  string `json:"text"`
 		Item  *struct {
 			ID   string `json:"id"`
 			Type string `json:"type"`
@@ -597,6 +598,14 @@ func (c *responsesConverter) convertLine(line []byte) []byte {
 			return nil
 		}
 		return marshalDelta(map[string]any{"role": "assistant", "content": ev.Delta}, "", nil)
+	case "response.output_text.done":
+		// Some upstreams (notably with tools present) emit the full text
+		// once instead of streaming deltas; without this the reply is
+		// silently empty downstream.
+		if ev.Text == "" {
+			return nil
+		}
+		return marshalDelta(map[string]any{"role": "assistant", "content": ev.Text}, "", nil)
 	case "response.output_item.added":
 		if ev.Item == nil || ev.Item.Type != "function_call" {
 			return nil
