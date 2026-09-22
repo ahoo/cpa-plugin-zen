@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
@@ -259,7 +260,7 @@ func TestChatCloakKeepsClientTools(t *testing.T) {
 
 func TestResponsesBodyConversion(t *testing.T) {
 	raw := []byte(`{"model":"muse-free","messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"hi"}],"max_tokens":20}`)
-	out, err := buildResponsesBody(raw, "muse-spark-1.3-contributor-free", []any{})
+	out, err := buildResponsesBody(raw, "muse-spark-1.3-contributor-free", []any{}, 0)
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
@@ -393,7 +394,7 @@ func TestFreeHeadersAuthModes(t *testing.T) {
 
 func TestResponsesMaxOutputTokensClamped(t *testing.T) {
 	raw := []byte(`{"model":"muse-free","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`)
-	out, err := buildResponsesBody(raw, "muse-spark-1.3-contributor-free", []any{})
+	out, err := buildResponsesBody(raw, "muse-spark-1.3-contributor-free", []any{}, 0)
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
@@ -418,5 +419,38 @@ func TestFreeRetryableGateRotates(t *testing.T) {
 		if freeRetryable(status, nil) {
 			t.Fatalf("status %d must fail fast", status)
 		}
+	}
+}
+
+func TestResponsesMinOutputFloor(t *testing.T) {
+	entry := FreeModelEntry{MinOutputTokens: 1024}
+	raw := []byte(`{"model":"muse-free","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`)
+	out, err := buildResponsesBody(raw, "muse-spark-1.3-contributor-free", []any{}, entry.MinOutputTokens)
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	var decoded struct {
+		MaxOutputTokens int `json:"max_output_tokens"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.MaxOutputTokens != 1024 {
+		t.Fatalf("max_output_tokens = %d, want floored 1024", decoded.MaxOutputTokens)
+	}
+}
+
+func TestEmptyStreamEmitsTerminal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := convertResponsesSSE(ctx, []byte("data: {\"type\":\"response.created\"}\n\ndata: [DONE]\n"), framingBare)
+	n := 0
+	for chunk := range ch {
+		if len(bytes.TrimSpace(chunk.Payload)) > 0 {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("empty stream must yield exactly one terminal chunk, got %d", n)
 	}
 }

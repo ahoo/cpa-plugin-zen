@@ -170,6 +170,10 @@ type FreeModelEntry struct {
 	Endpoint    string                 `yaml:"endpoint"` // chat|responses|systemone
 	DisplayName string                 `yaml:"display_name"`
 	Questions   map[string]QuestionDef `yaml:"questions"`
+	// MinOutputTokens floors the output budget (thinking models burn budget
+	// on reasoning first; too small yields empty streams). Default 1024 for
+	// responses, 0 (no floor) otherwise.
+	MinOutputTokens int `yaml:"min_output_tokens"`
 }
 
 // cloakConfig is the agent-shape disguise for gated chat/responses models.

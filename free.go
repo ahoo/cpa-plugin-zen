@@ -323,7 +323,7 @@ func applyChatCloak(payload []byte, tools []map[string]any, minTools int) ([]byt
 
 // buildResponsesBody converts an OpenAI chat payload to a Responses request.
 // tools must already be topped up by the caller.
-func buildResponsesBody(payload []byte, upstreamModel string, tools []any) ([]byte, error) {
+func buildResponsesBody(payload []byte, upstreamModel string, tools []any, minOutput int) ([]byte, error) {
 	var chat struct {
 		Messages []struct {
 			Role    string          `json:"role"`
@@ -372,9 +372,15 @@ func buildResponsesBody(payload []byte, upstreamModel string, tools []any) ([]by
 	} else {
 		out["max_output_tokens"] = 1024
 	}
-	// Upstream rejects max_output_tokens < 16; clamp rather than fail.
-	if n, ok := out["max_output_tokens"].(int); ok && n < 16 {
-		out["max_output_tokens"] = 16
+	// Upstream rejects max_output_tokens < 16; thinking models additionally
+	// burn budget on reasoning, so floor small requests to leave room for
+	// an answer instead of ending the stream empty.
+	floor := minOutput
+	if floor <= 0 {
+		floor = 16
+	}
+	if n, ok := out["max_output_tokens"].(int); ok && n < floor {
+		out["max_output_tokens"] = floor
 	}
 	return json.Marshal(out)
 }
@@ -703,7 +709,11 @@ func (e *Executor) freeAttempt(ctx context.Context, req pluginapi.ExecutorReques
 	case "responses":
 		existing := existingTools(req.Payload)
 		merged := mergeTools(existing, tools, minTools)
-		body, err = buildResponsesBody(req.Payload, strings.TrimSpace(entry.Name), merged)
+		floor := entry.MinOutputTokens
+		if floor <= 0 {
+			floor = 1024
+		}
+		body, err = buildResponsesBody(req.Payload, strings.TrimSpace(entry.Name), merged, floor)
 	case "systemone":
 		var upstream string
 		upstream, body, err = buildUpstreamBody(req.Model, req.Payload, e.cfg)
@@ -1010,11 +1020,14 @@ func forwardChatSSE(ctx context.Context, sse []byte, framing streamFraming) <-ch
 }
 
 // convertResponsesSSE converts Responses SSE to OpenAI deltas incrementally.
+// A terminal empty chunk is emitted when nothing else was, so downstream
+// never sees a bare stream end as a transport error.
 func convertResponsesSSE(ctx context.Context, sse []byte, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk, 8)
 	go func() {
 		defer close(out)
 		c := newResponsesConverter()
+		emitted := 0
 		emit := func(payload []byte) bool {
 			if len(bytes.TrimSpace(payload)) == 0 {
 				return true
@@ -1026,6 +1039,7 @@ func convertResponsesSSE(ctx context.Context, sse []byte, framing streamFraming)
 			case <-ctx.Done():
 				return false
 			case out <- pluginapi.ExecutorStreamChunk{Payload: payload}:
+				emitted++
 				return true
 			}
 		}
@@ -1040,6 +1054,12 @@ func convertResponsesSSE(ctx context.Context, sse []byte, framing streamFraming)
 				return
 			default:
 			}
+		}
+		if emitted == 0 {
+			terminal, _ := json.Marshal(map[string]any{
+				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+			})
+			emit(terminal)
 		}
 	}()
 	return out
