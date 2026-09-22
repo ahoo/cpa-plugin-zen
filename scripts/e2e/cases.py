@@ -110,8 +110,12 @@ def case2(base):
 
 
 def case3(base):
-    """SystemOne paid: jev native jeopardy shape returns content."""
-    st, h, raw = post_chat(base, "jev")
+    """SystemOne paid: jev needs a native {state, questions} envelope."""
+    env = json.dumps({
+        "state": "e2e-probe",
+        "questions": {"q1": {"type": "noul", "instructions": "e2e-probe: reply PONG"}},
+    })
+    st, h, raw = post_chat(base, "jev", prompt=env)
     t = text_of(raw)
     if st == 200 and t:
         return True, f"200 text={t[:60]!r}"
@@ -119,11 +123,15 @@ def case3(base):
 
 
 def case4(base):
-    """jev-free: free-first with paid fallback still answers."""
-    st, h, raw = post_chat(base, "jev-free")
+    """jev-free: free-first with paid fallback still answers (envelope shape)."""
+    env = json.dumps({
+        "state": "e2e-probe",
+        "questions": {"q1": {"type": "noul", "instructions": "e2e-probe: reply PONG"}},
+    })
+    st, h, raw = post_chat(base, "jev-free", prompt=env)
     t = text_of(raw)
     if st == 200 and t:
-        return True, f"200 session={hdr(h, POOL_HDR)!r} text={t[:60]!r}"
+        return True, f"200 echo={hdr(h, POOL_HDR)!r} text={t[:60]!r}"
     return False, f"status={st} raw={raw[:200]!r}"
 
 
