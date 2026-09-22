@@ -843,6 +843,12 @@ func mergeTools(existing []any, cloak []map[string]any, minTools int) []any {
 func (e *Executor) executeFree(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) (pluginapi.ExecutorResponse, error) {
 	body, headers, endpoint, err := e.freeCall(ctx, req, entry)
 	if err != nil {
+		// Free hard failure: paid fallback before surfacing anything.
+		if e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
+			if fbBody, fbHeaders, _, fbErr := e.paidFallback(ctx, req, err); fbErr == nil {
+				return pluginapi.ExecutorResponse{Payload: fbBody, Headers: fbHeaders}, nil
+			}
+		}
 		return pluginapi.ExecutorResponse{}, err
 	}
 	var mapped []byte
@@ -898,7 +904,30 @@ func isEmptyCompletion(mapped []byte) bool {
 func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) (pluginapi.ExecutorStreamResponse, error) {
 	body, headers, _, err := e.freeCall(ctx, req, entry)
 	if err != nil {
-		return pluginapi.ExecutorStreamResponse{}, err
+		// Free hard failure on a stream: answer via paid fallback chunks
+		// rather than closing bare (downstream reads that as transport
+		// failure). Final resort is a graceful terminal chunk.
+		if e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
+			if fbBody, _, _, fbErr := e.paidFallback(ctx, req, err); fbErr == nil {
+				framing := framingForRequest(req)
+				ch := make(chan pluginapi.ExecutorStreamChunk, 8)
+				go func() {
+					defer close(ch)
+					for _, piece := range chunkCompletion(req.Model, fbBody, framing) {
+						select {
+						case <-ctx.Done():
+							return
+						case ch <- pluginapi.ExecutorStreamChunk{Payload: piece}:
+						}
+					}
+				}()
+				return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: ch}, nil
+			}
+		}
+		ch := make(chan pluginapi.ExecutorStreamChunk, 1)
+		ch <- pluginapi.ExecutorStreamChunk{Payload: terminalChunk(req.Model, framingForRequest(req))}
+		close(ch)
+		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: ch}, nil
 	}
 	kind := strings.ToLower(strings.TrimSpace(entry.Endpoint))
 	if kind == "systemone" {
@@ -927,6 +956,21 @@ func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.Executor
 	return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: e.streamWithPaidFallback(ctx, req, base, framingForRequest(req))}, nil
 }
 
+// terminalChunk builds a graceful stream end carrying the model identity so
+// downstream never sees a bare stream end as a transport error.
+func terminalChunk(model string, framing streamFraming) []byte {
+	raw, _ := json.Marshal(map[string]any{
+		"model":   model,
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+	})
+	if framing == framingClaude {
+		return append([]byte("data: "), raw...)
+	}
+	return raw
+}
+
+// When the stream ends empty (free-tier silent degradation), it runs the
+// paid fallback and emits its answer as stream chunks instead.
 // streamWithPaidFallback relays upstream chunks, counting data payloads.
 // When the stream ends empty (free-tier silent degradation), it runs the
 // paid fallback and emits its answer as stream chunks instead.
