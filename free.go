@@ -138,6 +138,10 @@ func (p *sessionPool) report(id string, ok bool, cooldownSec int) {
 // and never forward it.
 const poolSessionHeader = "X-Zen-Pool-Session"
 
+// fallbackHeader marks responses served by paid fallback instead of the free
+// tier, so e2e can tell "free down, fallback covered" apart from "free served".
+const fallbackHeader = "X-Zen-Fallback"
+
 // stampPoolSession records the pool session that served the request on the
 // response headers for observability (e2e stickiness assertions). It never
 // touches upstream-bound headers: executors build those separately.
@@ -861,6 +865,10 @@ func (e *Executor) executeFree(ctx context.Context, req pluginapi.ExecutorReques
 		// Free hard failure: paid fallback before surfacing anything.
 		if e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
 			if fbBody, fbHeaders, _, fbErr := e.paidFallback(ctx, req, err); fbErr == nil {
+				if fbHeaders == nil {
+					fbHeaders = http.Header{}
+				}
+				fbHeaders.Set(fallbackHeader, "paid")
 				return pluginapi.ExecutorResponse{Payload: fbBody, Headers: fbHeaders}, nil
 			}
 		}
@@ -924,6 +932,8 @@ func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.Executor
 		// failure). Final resort is a graceful terminal chunk.
 		if e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
 			if fbBody, _, _, fbErr := e.paidFallback(ctx, req, err); fbErr == nil {
+				headers = http.Header{}
+				headers.Set(fallbackHeader, "paid")
 				framing := framingForRequest(req)
 				ch := make(chan pluginapi.ExecutorStreamChunk, 8)
 				go func() {

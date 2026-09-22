@@ -7,6 +7,13 @@
 # Usage: ./run.sh [--quick] [--base URL] [--cases "1 2 3"]
 set -u
 BASE="${BASE:-http://127.0.0.1:8317}"
+# Gateway auth: env E2E_API_KEY wins, else first api-key from the live config
+# (runtime read, never committed).
+if [[ -z "${E2E_API_KEY:-}" ]]; then
+  CFG="${E2E_CONFIG:-/home/ubuntu/workspace/cliproxyapi/config.yaml}"
+  E2E_API_KEY="$(grep -m1 -A30 '^api-keys:' "$CFG" 2>/dev/null | grep -m1 -o 'sk-[A-Za-z0-9_-]*' || true)"
+  export E2E_API_KEY
+fi
 QUICK=0
 CASES=""
 while [[ $# -gt 0 ]]; do

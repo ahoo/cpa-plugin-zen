@@ -10,6 +10,7 @@ Retry policy lives in run.sh, not here.
 """
 import argparse
 import json
+import os
 import sys
 import urllib.request
 import urllib.error
@@ -17,6 +18,7 @@ import urllib.error
 POOL_HDR = "X-Zen-Pool-Session"
 PROMPT = "e2e-probe: reply with exactly the word PONG and nothing else."
 TIMEOUT = 150
+API_KEY = os.environ.get("E2E_API_KEY", "")
 
 
 def post_chat(base, model, prompt=PROMPT, max_tokens=32, stream=False, headers=None):
@@ -27,10 +29,13 @@ def post_chat(base, model, prompt=PROMPT, max_tokens=32, stream=False, headers=N
         "stream": stream,
     }
     data = json.dumps(body).encode()
+    hdrs = {"Content-Type": "application/json", **(headers or {})}
+    if API_KEY:
+        hdrs["Authorization"] = "Bearer " + API_KEY
     req = urllib.request.Request(
         base.rstrip("/") + "/v1/chat/completions",
         data=data,
-        headers={"Content-Type": "application/json", **(headers or {})},
+        headers=hdrs,
         method="POST",
     )
     try:

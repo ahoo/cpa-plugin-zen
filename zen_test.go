@@ -585,3 +585,9 @@ func TestStampPoolSessionEcho(t *testing.T) {
 		t.Fatal("empty session must not stamp")
 	}
 }
+
+func TestFallbackHeaderConst(t *testing.T) {
+	if fallbackHeader != "X-Zen-Fallback" {
+		t.Fatalf("fallback marker renamed: %q", fallbackHeader)
+	}
+}
