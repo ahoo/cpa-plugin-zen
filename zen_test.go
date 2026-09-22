@@ -529,3 +529,20 @@ func TestFreeBodyRetryable(t *testing.T) {
 		t.Fatal("empty body must not rotate")
 	}
 }
+
+func TestStreamFallbackOnEmpty(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	empty := make(chan pluginapi.ExecutorStreamChunk)
+	close(empty)
+	_, p, _ := Build([]byte("free:\n  enabled: true\n"))
+	p.executor.cfg.Free.Quota.FailoverPaid = false
+	out := p.executor.streamWithPaidFallback(ctx, pluginapi.ExecutorRequest{}, empty, framingBare)
+	n := 0
+	for range out {
+		n++
+	}
+	if n != 0 {
+		t.Fatalf("without fallback, empty stream must stay empty, got %d", n)
+	}
+}
