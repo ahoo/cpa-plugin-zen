@@ -199,7 +199,7 @@ func defaultModelEntries() []ModelEntry {
 // paid: free-first with paid fallback beats paid-only.
 func defaultFreeModels() []FreeModelEntry {
 	return []FreeModelEntry{
-		{Alias: "mimo-free", Name: "mimo-v2.5-free", Endpoint: "chat"},
+		{Alias: "mimo-free", Name: "mimo-v2.6-flash-free", Endpoint: "chat"},
 		{Alias: "ling-free", Name: "ling-3.0-flash-fin-free", Endpoint: "chat"},
 		{Alias: "nemotron-free", Name: "nemotron-3-ultra-free", Endpoint: "chat"},
 		{Alias: "muse-free", Name: "muse-spark-1.3-contributor-free", Endpoint: "responses"},

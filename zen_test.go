@@ -177,7 +177,7 @@ free:
   enabled: true
   models:
     - alias: mimo-free
-      name: mimo-v2.5-free
+      name: mimo-v2.6-flash-free
       endpoint: chat
     - alias: muse-free
       name: muse-spark-1.3-contributor-free
@@ -194,7 +194,7 @@ free:
 
 func TestFreeClaimsPrecedence(t *testing.T) {
 	cfg := freeTestConfig()
-	for _, name := range []string{"mimo-free", "mimo-v2.5-free", "muse-free", "zen/mimo-free"} {
+	for _, name := range []string{"mimo-free", "mimo-v2.6-flash-free", "muse-free", "zen/mimo-free"} {
 		if cfg.freeEntry(name) == nil {
 			t.Fatalf("%q should resolve to a free entry", name)
 		}
