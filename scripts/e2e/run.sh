@@ -37,10 +37,12 @@ pass=0; flake=0; fail=0
 declare -a ROWS
 for c in $CASES; do
   attempt=0; ok=0; first_fail=""
+  tmp="$(mktemp)"
   while [[ $attempt -lt 3 ]]; do
     attempt=$((attempt+1))
-    out="$(python3 "$DIR/cases.py" --base "$BASE" --case "$c" 2>&1)"
-    if python3 -c "import json,sys; sys.exit(0 if json.loads('''$out'''.strip().splitlines()[-1])['ok'] else 1)" 2>/dev/null; then
+    python3 "$DIR/cases.py" --base "$BASE" --case "$c" >"$tmp" 2>&1
+    out="$(tail -n 1 "$tmp")"
+    if python3 -c "import json,sys; sys.exit(0 if json.load(open('$tmp'))['ok'] else 1)" 2>/dev/null; then
       ok=1; break
     fi
     [[ -z "$first_fail" ]] && first_fail="$out"
@@ -53,6 +55,7 @@ for c in $CASES; do
   else
     fail=$((fail+1)); ROWS+=("case $c  FAIL x3 (last: $out)")
   fi
+  rm -f "$tmp"
 done
 
 echo "=== zen e2e ($BASE) cases: $CASES ==="
