@@ -1034,6 +1034,7 @@ func (e *Executor) paidFallback(ctx context.Context, req pluginapi.ExecutorReque
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(requestPayload(req), &decoded); err != nil {
+		b := requestPayload(req)
 		return nil, nil, "", statusError{statusCode: http.StatusBadRequest, msg: "zen free executor: invalid chat payload"}
 	}
 	decoded["model"] = fallback
