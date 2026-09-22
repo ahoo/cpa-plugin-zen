@@ -455,21 +455,6 @@ func TestEmptyStreamYieldsNothing(t *testing.T) {
 	}
 }
 
-func TestIsEmptyCompletion(t *testing.T) {
-	if !isEmptyCompletion([]byte(`{"choices":[{"message":{"role":"assistant","content":"  "}}]}`)) {
-		t.Fatal("blank content must count as empty")
-	}
-	if isEmptyCompletion([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}]}`)) {
-		t.Fatal("real content must not count as empty")
-	}
-	if isEmptyCompletion([]byte(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"1"}]}}]}`)) {
-		t.Fatal("tool calls must not count as empty")
-	}
-	if isEmptyCompletion([]byte(`not-json`)) {
-		t.Fatal("unparseable must fail open (non-empty)")
-	}
-}
-
 func TestStickyAssignStable(t *testing.T) {
 	p := &sessionPool{sessions: []sessionEntry{{ID: "s1"}, {ID: "s2"}, {ID: "s3"}}}
 	a := p.assign("conv-42")
@@ -527,45 +512,5 @@ func TestFreeBodyRetryable(t *testing.T) {
 	}
 	if freeBodyRetryable(nil) {
 		t.Fatal("empty body must not rotate")
-	}
-}
-
-func TestStreamFallbackOnEmpty(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	empty := make(chan pluginapi.ExecutorStreamChunk)
-	close(empty)
-	_, p, _ := Build([]byte("free:\n  enabled: true\n"))
-	p.executor.cfg.Free.Quota.FailoverPaid = false
-	out := p.executor.streamWithPaidFallback(ctx, pluginapi.ExecutorRequest{Model: "muse-free"}, empty, framingBare)
-	var chunks [][]byte
-	for c := range out {
-		chunks = append(chunks, c.Payload)
-	}
-	if len(chunks) != 1 {
-		t.Fatalf("without fallback, empty stream must yield one terminal chunk, got %d", len(chunks))
-	}
-	var decoded struct {
-		Model   string `json:"model"`
-		Choices []struct {
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(chunks[0], &decoded); err != nil {
-		t.Fatalf("terminal chunk must be JSON: %v", err)
-	}
-	if decoded.Model != "muse-free" || len(decoded.Choices) != 1 || decoded.Choices[0].FinishReason != "stop" {
-		t.Fatalf("terminal chunk wrong: %+v", decoded)
-	}
-}
-
-func TestFallbackFloor(t *testing.T) {
-	cfg := parseConfig([]byte("paid:\n  api_keys:\n    - key: sk-x\nfree:\n  enabled: true\n  quota:\n    failover_paid: true\n    paid_fallback: deepseek-v4.1-flash\n    fallback_min_tokens: 512\n"))
-	if cfg.fallbackFloor() != 512 {
-		t.Fatalf("floor = %d", cfg.fallbackFloor())
-	}
-	def := parseConfig([]byte("paid:\n  api_keys:\n    - key: sk-x\n"))
-	if def.fallbackFloor() != 512 {
-		t.Fatalf("default floor = %d", def.fallbackFloor())
 	}
 }

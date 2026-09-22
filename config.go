@@ -18,7 +18,7 @@ type pluginConfig struct {
 	// never share these keys.
 	Paid paidConfig `yaml:"paid"`
 	// Free carries anonymous free-tier models with per-endpoint cloak,
-	// egress pool and quota fallback. Never uses paid keys.
+	// egress pool with cooldown. Never uses paid keys.
 	Free freeConfig `yaml:"free"`
 
 	// Derived indexes (see buildIndexes). Not YAML fields.
@@ -183,21 +183,9 @@ type cloakConfig struct {
 	Tools    []map[string]any `yaml:"tools"`
 }
 
-// quotaConfig governs free-pool cooldown and paid fallback.
+// quotaConfig governs free-pool cooldowns.
 type quotaConfig struct {
-	Cooldown     int    `yaml:"cooldown"` // seconds a failed member/session cools down
-	FailoverPaid bool   `yaml:"failover_paid"`
-	PaidFallback string `yaml:"paid_fallback"` // paid model alias used when free is exhausted
-	// FallbackMinTokens floors the output budget on fallback calls: tiny
-	// budgets burn out on thinking models and return empty. Default 512.
-	FallbackMinTokens int `yaml:"fallback_min_tokens"`
-}
-
-func (c *pluginConfig) fallbackFloor() int {
-	if c != nil && c.Free.Quota.FallbackMinTokens > 0 {
-		return c.Free.Quota.FallbackMinTokens
-	}
-	return 512
+	Cooldown int `yaml:"cooldown"` // seconds a failed member/session cools down
 }
 
 func (c *pluginConfig) cooldown() int {
