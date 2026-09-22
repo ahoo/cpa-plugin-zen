@@ -99,14 +99,44 @@ func (p *ZenPlugin) InterceptRequestAfterAuth(ctx context.Context, req pluginapi
 }
 
 func (p *ZenPlugin) interceptSession(req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
-	if p.cfg == nil || !p.cfg.SessionMapping.effective() {
+	if p.cfg == nil {
 		return pluginapi.RequestInterceptResponse{}, nil
 	}
-	mapped := mapSessionHeaders(map[string][]string(req.Headers), req.Metadata)
-	if len(mapped) == 0 {
+	headers := map[string][]string(req.Headers)
+	var out map[string][]string
+	if p.cfg.SessionMapping.effective() {
+		out = mapSessionHeaders(headers, req.Metadata)
+	}
+	// Sticky free-pool assignment: bind the downstream conversation to one
+	// pool session so consecutive turns share upstream affinity instead of
+	// scattering across (and burning) sessions at random.
+	isFree := p.cfg.freeEntry(req.RequestedModel) != nil ||
+		(req.Model != "" && p.cfg.freeEntry(req.Model) != nil)
+	if isFree {
+		if downstream := stickyDownstreamID(headers, req.Metadata); downstream != "" {
+			if assigned := p.executor.sessions.assign(downstream); assigned != "" {
+				if out == nil {
+					out = map[string][]string{}
+				}
+				out[poolSessionHeader] = []string{assigned}
+			}
+		}
+	}
+	if len(out) == 0 {
 		return pluginapi.RequestInterceptResponse{}, nil
 	}
-	return pluginapi.RequestInterceptResponse{Headers: mapped}, nil
+	return pluginapi.RequestInterceptResponse{Headers: out}, nil
+}
+
+// stickyDownstreamID reuses the session-source priority scan (plus metadata
+// fallback) to identify the downstream conversation for pool stickiness.
+func stickyDownstreamID(headers map[string][]string, metadata map[string]any) string {
+	for _, src := range sessionSources {
+		if v, exists := sessionHeaderValue(headers, src); exists && v != "" {
+			return v
+		}
+	}
+	return sessionFallback(metadata)
 }
 
 // StaticModels returns the Zen direct models served through this executor.

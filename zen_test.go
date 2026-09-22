@@ -469,3 +469,51 @@ func TestIsEmptyCompletion(t *testing.T) {
 		t.Fatal("unparseable must fail open (non-empty)")
 	}
 }
+
+func TestStickyAssignStable(t *testing.T) {
+	p := &sessionPool{sessions: []sessionEntry{{ID: "s1"}, {ID: "s2"}, {ID: "s3"}}}
+	a := p.assign("conv-42")
+	b := p.assign("conv-42")
+	if a == "" || a != b {
+		t.Fatalf("assignment must be stable: %q vs %q", a, b)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 30; i++ {
+		seen[p.assign("conv-"+string(rune('a'+i)))] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("assignments must distribute, got %v", seen)
+	}
+	p.report(a, false, 3600)
+	if got := p.assign("conv-42"); got == a {
+		t.Fatalf("cooled session must be skipped, got %q", got)
+	}
+	if got := p.assign(""); got != "" {
+		t.Fatalf("empty downstream must yield nothing, got %q", got)
+	}
+}
+
+func TestInterceptorStampsPoolSession(t *testing.T) {
+	_, p, _ := Build([]byte("free:\n  enabled: true\n"))
+	p.executor.sessions.sessions = []sessionEntry{{ID: "s1"}, {ID: "s2"}}
+	resp, err := p.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		RequestedModel: "mimo-free",
+		Headers:        map[string][]string{"Session-Id": {"conv-7"}},
+	})
+	if err != nil {
+		t.Fatalf("intercept: %v", err)
+	}
+	if got := resp.Headers.Get(poolSessionHeader); got == "" {
+		t.Fatal("free-bound request with session must be stamped")
+	}
+	resp2, err := p.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		RequestedModel: "deepseek-flash",
+		Headers:        map[string][]string{"Session-Id": {"conv-7"}},
+	})
+	if err != nil {
+		t.Fatalf("intercept: %v", err)
+	}
+	if got := resp2.Headers.Get(poolSessionHeader); got != "" {
+		t.Fatalf("non-free request must not be stamped, got %q", got)
+	}
+}

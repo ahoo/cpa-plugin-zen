@@ -132,6 +132,45 @@ func (p *sessionPool) report(id string, ok bool, cooldownSec int) {
 	}
 }
 
+// poolSessionHeader carries the sticky pool assignment from the
+// interceptor to the executor. Internal only: executors build their own
+// upstream headers and never forward it.
+const poolSessionHeader = "X-Zen-Pool-Session"
+
+// assign binds a downstream conversation identity to one pool session
+// (stable hash, forward probe past cooled/failed entries). Empty when the
+// pool has no usable session.
+func (p *sessionPool) assign(downstream string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.sessions)
+	if n == 0 || strings.TrimSpace(downstream) == "" {
+		return ""
+	}
+	now := time.Now().Unix()
+	start := int(fnvHash(downstream) % uint64(n))
+	for i := 0; i < n; i++ {
+		s := &p.sessions[(start+i)%n]
+		if s.Fails < 5 && s.CooldownUntil <= now {
+			return s.ID
+		}
+	}
+	return ""
+}
+
+func fnvHash(s string) uint64 {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+	h := uint64(offset)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
+}
+
 // egressPool rotates exit proxies for free traffic (trial quota is
 // IP-bound). Cooldowns live in memory; disabled members are filtered at
 // build time.
@@ -871,7 +910,7 @@ func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.Executor
 func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) ([]byte, http.Header, string, error) {
 	cooldown := e.cfg.cooldown()
 	var lastErr error
-	sessions := e.freeSessions(entry)
+	sessions := e.freeSessions(entry, req)
 	order := e.freepool.order()
 	attempts := 0
 	for _, mi := range order {
@@ -914,9 +953,15 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 	return nil, nil, "", statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: no healthy session or member"}
 }
 
-// freeSessions returns candidate session IDs (empty for systemone, which
-// needs none). At most 3 sessions per request to bound attempts.
-func (e *Executor) freeSessions(entry FreeModelEntry) []string {
+// freeSessions returns candidate session IDs: the interceptor-stamped
+// sticky assignment when healthy, else round-robin picks (empty for
+// systemone, which needs none). At most 3 sessions per request.
+func (e *Executor) freeSessions(entry FreeModelEntry, req pluginapi.ExecutorRequest) []string {
+	if stamped := strings.TrimSpace(req.Headers.Get(poolSessionHeader)); stamped != "" {
+		if e.sessionUsable(stamped) {
+			return []string{stamped}
+		}
+	}
 	if strings.EqualFold(strings.TrimSpace(entry.Endpoint), "systemone") {
 		return []string{""}
 	}
@@ -937,6 +982,19 @@ func (e *Executor) freeSessions(entry FreeModelEntry) []string {
 		out = append(out, "")
 	}
 	return out
+}
+
+func (e *Executor) sessionUsable(id string) bool {
+	e.sessions.mu.Lock()
+	defer e.sessions.mu.Unlock()
+	now := time.Now().Unix()
+	for i := range e.sessions.sessions {
+		if e.sessions.sessions[i].ID != id {
+			continue
+		}
+		return e.sessions.sessions[i].Fails < 5 && e.sessions.sessions[i].CooldownUntil <= now
+	}
+	return false
 }
 
 func (e *Executor) coolFree(session string, memberIdx int, cooldown int) {
