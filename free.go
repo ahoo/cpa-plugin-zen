@@ -295,6 +295,20 @@ func (r *lockedRand) intn(n int) int {
 	return r.rnd.Intn(n)
 }
 
+// requestPayload returns the translated provider payload, falling back to
+// the raw client body when translation yields nothing parseable.
+func requestPayload(req pluginapi.ExecutorRequest) []byte {
+	if len(bytes.TrimSpace(req.Payload)) > 0 {
+		var probe struct {
+			Messages []any `json:"messages"`
+		}
+		if json.Unmarshal(req.Payload, &probe) == nil && len(probe.Messages) > 0 {
+			return req.Payload
+		}
+	}
+	return req.OriginalRequest
+}
+
 // freeHeaders builds the genuine-CLI header set for free calls. Empty key
 // selects the anonymous tier (Bearer public); otherwise the logged-in key.
 func freeHeaders(sessionID, key string) http.Header {
@@ -742,20 +756,21 @@ func (e *Executor) freeAttempt(ctx context.Context, req pluginapi.ExecutorReques
 	url := base + freeUpstreamPath(entry.Endpoint)
 	tools := cloakTools(e.cfg)
 	minTools := cloakMinTools(e.cfg)
+	payload := requestPayload(req)
 	var body []byte
 	var err error
 	switch strings.ToLower(strings.TrimSpace(entry.Endpoint)) {
 	case "responses":
-		existing := existingTools(req.Payload)
+		existing := existingTools(payload)
 		merged := mergeTools(existing, tools, minTools)
 		floor := entry.MinOutputTokens
 		if floor <= 0 {
 			floor = 1024
 		}
-		body, err = buildResponsesBody(req.Payload, strings.TrimSpace(entry.Name), merged, floor)
+		body, err = buildResponsesBody(payload, strings.TrimSpace(entry.Name), merged, floor)
 	case "systemone":
 		var upstream string
-		upstream, body, err = buildUpstreamBody(req.Model, req.Payload, e.cfg)
+		upstream, body, err = buildUpstreamBody(req.Model, payload, e.cfg)
 		_ = upstream
 		if err == nil {
 			// Free aliases never rewrite via the shared table; resolve
@@ -765,7 +780,7 @@ func (e *Executor) freeAttempt(ctx context.Context, req pluginapi.ExecutorReques
 			}
 		}
 	default:
-		body, err = applyChatCloak(req.Payload, tools, minTools)
+		body, err = applyChatCloak(payload, tools, minTools)
 		if upstream := strings.TrimSpace(entry.Name); upstream != "" {
 			body, err = setBodyModel(body, upstream, err)
 		}
@@ -1018,7 +1033,7 @@ func (e *Executor) paidFallback(ctx context.Context, req pluginapi.ExecutorReque
 		return nil, nil, "", statusError{statusCode: http.StatusUnauthorized, msg: missingKeyMsg}
 	}
 	var decoded map[string]any
-	if err := json.Unmarshal(req.Payload, &decoded); err != nil {
+	if err := json.Unmarshal(requestPayload(req), &decoded); err != nil {
 		return nil, nil, "", statusError{statusCode: http.StatusBadRequest, msg: "zen free executor: invalid chat payload"}
 	}
 	decoded["model"] = fallback
