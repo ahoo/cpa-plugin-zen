@@ -17,11 +17,15 @@ type pluginConfig struct {
 	// endpoint kinds in later phases. Free-tier pools arrive separately and
 	// never share these keys.
 	Paid paidConfig `yaml:"paid"`
+	// Free carries anonymous free-tier models with per-endpoint cloak,
+	// egress pool and quota fallback. Never uses paid keys.
+	Free freeConfig `yaml:"free"`
 
 	// Derived indexes (see buildIndexes). Not YAML fields.
 	claimed   map[string]struct{}
 	rewrites  map[string]string
 	questions map[string]map[string]QuestionDef
+	free      map[string]FreeModelEntry
 }
 
 // sessionMappingConfig toggles conversation session forwarding.
@@ -123,6 +127,60 @@ type APIKeyEntry struct {
 	ProxyURL string `yaml:"proxy_url"`
 }
 
+// freeConfig is the anonymous free-tier pool.
+type freeConfig struct {
+	Enabled     bool             `yaml:"enabled"`
+	Models      []FreeModelEntry `yaml:"models"`
+	Cloak       cloakConfig      `yaml:"cloak"`
+	Egress      []EgressEntry    `yaml:"egress"`
+	Quota       quotaConfig      `yaml:"quota"`
+	SessionPool string           `yaml:"session_pool"`
+}
+
+// FreeModelEntry maps a client alias to an upstream free model + endpoint.
+type FreeModelEntry struct {
+	Alias       string                `yaml:"alias"`
+	Name        string                `yaml:"name"`
+	Endpoint    string                `yaml:"endpoint"` // chat|responses|systemone
+	DisplayName string                `yaml:"display_name"`
+	Questions   map[string]QuestionDef `yaml:"questions"`
+}
+
+// cloakConfig is the agent-shape disguise for gated chat/responses models.
+type cloakConfig struct {
+	Stream   bool             `yaml:"stream"`
+	MinTools int              `yaml:"min_tools"`
+	Tools    []map[string]any `yaml:"tools"`
+}
+
+// EgressEntry is one exit proxy for free traffic (trial quota is IP-bound).
+type EgressEntry struct {
+	URL      string `yaml:"url"`
+	Weight   int    `yaml:"weight"`
+	Disabled bool   `yaml:"disabled"`
+}
+
+func (en EgressEntry) normWeight() int {
+	if en.Weight <= 0 {
+		return 1
+	}
+	return en.Weight
+}
+
+// quotaConfig governs free-pool cooldown and paid fallback.
+type quotaConfig struct {
+	Cooldown     int    `yaml:"cooldown"` // seconds a failed member/session cools down
+	FailoverPaid bool   `yaml:"failover_paid"`
+	PaidFallback string `yaml:"paid_fallback"` // paid model alias used when free is exhausted
+}
+
+func (c *pluginConfig) cooldown() int {
+	if c != nil && c.Free.Quota.Cooldown > 0 {
+		return c.Free.Quota.Cooldown
+	}
+	return 300
+}
+
 func (en APIKeyEntry) normWeight() int {
 	if en.Weight <= 0 {
 		return 1
@@ -134,8 +192,27 @@ func (en APIKeyEntry) normWeight() int {
 func defaultModelEntries() []ModelEntry {
 	return []ModelEntry{
 		{Alias: "jev", Name: "jev-1.13"},
-		{Alias: "jev-free", Name: "jev-1.13-free"},
 	}
+}
+
+// defaultFreeModels are the built-in free aliases. jev-free moved here from
+// paid: free-first with paid fallback beats paid-only.
+func defaultFreeModels() []FreeModelEntry {
+	return []FreeModelEntry{
+		{Alias: "mimo-free", Name: "mimo-v2.5-free", Endpoint: "chat"},
+		{Alias: "ling-free", Name: "ling-3.0-flash-fin-free", Endpoint: "chat"},
+		{Alias: "nemotron-free", Name: "nemotron-3-ultra-free", Endpoint: "chat"},
+		{Alias: "muse-free", Name: "muse-spark-1.3-contributor-free", Endpoint: "responses"},
+		{Alias: "jev-free", Name: "jev-1.13-free", Endpoint: "systemone"},
+	}
+}
+
+// effectiveFreeModels returns configured free entries or built-in defaults.
+func (c *pluginConfig) effectiveFreeModels() []FreeModelEntry {
+	if c != nil && len(c.Free.Models) > 0 {
+		return c.Free.Models
+	}
+	return defaultFreeModels()
 }
 
 func parseConfig(raw []byte) *pluginConfig {
@@ -204,6 +281,35 @@ func (c *pluginConfig) buildIndexes() {
 			}
 		}
 	}
+	// Free claims take precedence and additionally resolve endpoint routing.
+	// Unclaimed when free is disabled so aliases fall through to native
+	// channels instead of being hijacked with nowhere to go.
+	c.free = make(map[string]FreeModelEntry, len(entries)*2)
+	if !c.Free.Enabled {
+		return
+	}
+	for _, entry := range c.effectiveFreeModels() {
+		alias := normalizeModel(entry.Alias)
+		name := strings.TrimSpace(entry.Name)
+		if alias != "" {
+			c.claimed[alias] = struct{}{}
+			c.free[alias] = entry
+		}
+		normalizedName := normalizeModel(name)
+		if normalizedName != "" {
+			c.claimed[normalizedName] = struct{}{}
+			c.free[normalizedName] = entry
+		}
+		if len(entry.Questions) > 0 {
+			if alias != "" {
+				c.questions[alias] = entry.Questions
+			}
+			if normalizedName != "" {
+				c.questions[normalizedName] = entry.Questions
+			}
+		}
+		// Free aliases never rewrite: the executor maps them itself.
+	}
 }
 
 // ensureIndexes builds the lookup tables if missing (zero-value configs in
@@ -237,6 +343,19 @@ func (c *pluginConfig) questionsFor(model string) map[string]QuestionDef {
 		return nil
 	}
 	return c.questions[normalizeModel(model)]
+}
+
+// freeEntry returns the free model entry for a client-requested model, or
+// nil when the model is not a free model (paid path applies).
+func (c *pluginConfig) freeEntry(model string) *FreeModelEntry {
+	if c == nil || !c.Free.Enabled {
+		return nil
+	}
+	c.ensureIndexes()
+	if entry, ok := c.free[normalizeModel(model)]; ok {
+		return &entry
+	}
+	return nil
 }
 
 func (c *pluginConfig) baseURL() string {

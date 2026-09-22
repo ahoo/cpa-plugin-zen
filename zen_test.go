@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -164,5 +165,180 @@ func TestMapToCompletion(t *testing.T) {
 	}
 	if len(out) == 0 {
 		t.Fatal("empty completion")
+	}
+}
+
+func freeTestConfig() *pluginConfig {
+	return parseConfig([]byte(`
+paid:
+  api_keys:
+    - key: sk-paid
+free:
+  enabled: true
+  models:
+    - alias: mimo-free
+      name: mimo-v2.5-free
+      endpoint: chat
+    - alias: muse-free
+      name: muse-spark-1.3-contributor-free
+      endpoint: responses
+  egress:
+    - url: http://127.0.0.1:18080
+      weight: 10
+  quota:
+    cooldown: 60
+    failover_paid: true
+    paid_fallback: deepseek/deepseek-v4.1-flash
+`))
+}
+
+func TestFreeClaimsPrecedence(t *testing.T) {
+	cfg := freeTestConfig()
+	for _, name := range []string{"mimo-free", "mimo-v2.5-free", "muse-free", "zen/mimo-free"} {
+		if cfg.freeEntry(name) == nil {
+			t.Fatalf("%q should resolve to a free entry", name)
+		}
+	}
+	if cfg.freeEntry("deepseek-flash") != nil {
+		t.Fatal("deepseek-flash must stay on native channels")
+	}
+	if cfg.freeEntry("jev") != nil {
+		t.Fatal("jev must stay on the paid path")
+	}
+}
+
+func TestChatCloakForcesAgentShape(t *testing.T) {
+	cfg := freeTestConfig()
+	raw := []byte(`{"model":"mimo-free","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`)
+	out, err := applyChatCloak(raw, cloakTools(cfg), cloakMinTools(cfg))
+	if err != nil {
+		t.Fatalf("cloak: %v", err)
+	}
+	var decoded struct {
+		Model      string `json:"model"`
+		Stream     bool   `json:"stream"`
+		Tools      []any  `json:"tools"`
+		ToolChoice string `json:"tool_choice"`
+		Messages   []any  `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !decoded.Stream {
+		t.Fatal("cloak must force stream:true")
+	}
+	if len(decoded.Tools) < 6 {
+		t.Fatalf("cloak must top up to 6 tools, got %d", len(decoded.Tools))
+	}
+	if decoded.ToolChoice != "auto" {
+		t.Fatalf("tool_choice = %q", decoded.ToolChoice)
+	}
+	if decoded.Model != "mimo-free" {
+		t.Fatalf("cloak must not rewrite model here, got %q", decoded.Model)
+	}
+}
+
+func TestChatCloakKeepsClientTools(t *testing.T) {
+	cfg := freeTestConfig()
+	tools := `[{"type":"function","function":{"name":"a","description":"a","parameters":{"type":"object","properties":{}}}}]`
+	raw := []byte(`{"model":"mimo-free","messages":[{"role":"user","content":"hi"}],"tools":` + tools + `}`)
+	out, err := applyChatCloak(raw, cloakTools(cfg), cloakMinTools(cfg))
+	if err != nil {
+		t.Fatalf("cloak: %v", err)
+	}
+	var decoded struct {
+		Tools []map[string]any `json:"tools"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded.Tools) != 6 || decoded.Tools[0]["type"] != "function" {
+		t.Fatalf("client tool must be preserved first: %+v", decoded.Tools)
+	}
+}
+
+func TestResponsesBodyConversion(t *testing.T) {
+	raw := []byte(`{"model":"muse-free","messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"hi"}],"max_tokens":20}`)
+	out, err := buildResponsesBody(raw, "muse-spark-1.3-contributor-free", []any{})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	var decoded struct {
+		Model           string `json:"model"`
+		Instructions    string `json:"instructions"`
+		Stream          bool   `json:"stream"`
+		Input           []any  `json:"input"`
+		MaxOutputTokens int    `json:"max_output_tokens"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Model != "muse-spark-1.3-contributor-free" || !decoded.Stream {
+		t.Fatalf("envelope wrong: %+v", decoded)
+	}
+	if decoded.Instructions != "Be brief." || len(decoded.Input) != 1 || decoded.MaxOutputTokens != 20 {
+		t.Fatalf("mapping wrong: %+v", decoded)
+	}
+}
+
+func TestAssembleChatCompletion(t *testing.T) {
+	sse := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n")
+	out, err := assembleChatCompletion("mimo-free", sse)
+	if err != nil {
+		t.Fatalf("assemble: %v", err)
+	}
+	var decoded struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Choices[0].Message.Content != "Hello" {
+		t.Fatalf("content = %q", decoded.Choices[0].Message.Content)
+	}
+}
+
+func TestResponsesConverterText(t *testing.T) {
+	c := newResponsesConverter()
+	line := []byte(`data: {"type":"response.output_text.delta","delta":"Hi"}`)
+	out := c.convertLine(line)
+	if len(out) == 0 {
+		t.Fatal("text delta dropped")
+	}
+	var decoded struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Choices[0].Delta.Content != "Hi" {
+		t.Fatalf("content = %q", decoded.Choices[0].Delta.Content)
+	}
+	if c.convertLine([]byte(`data: [DONE]`)) != nil {
+		t.Fatal("[DONE] must be swallowed")
+	}
+}
+
+func TestSessionPoolLoadAndCooldown(t *testing.T) {
+	p := &sessionPool{sessions: []sessionEntry{{ID: "a"}, {ID: "b"}}}
+	if got := p.pick(); got == "" {
+		t.Fatal("empty pick on healthy pool")
+	}
+	p.report("a", false, 3600)
+	p.report("b", false, 3600)
+	if got := p.pick(); got != "" {
+		t.Fatalf("cooled pool must yield nothing, got %q", got)
+	}
+	p.report("a", true, 0)
+	if got := p.pick(); got != "a" {
+		t.Fatalf("recovered session not picked: %q", got)
 	}
 }

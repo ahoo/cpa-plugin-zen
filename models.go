@@ -53,6 +53,29 @@ func (p *ModelProvider) ModelsForAuth(context.Context, pluginapi.AuthModelReques
 
 func (p *ModelProvider) models() []pluginapi.ModelInfo {
 	defs := p.registryModels()
+	for _, entry := range p.cfg.effectiveFreeModels() {
+		if p.cfg == nil || !p.cfg.Free.Enabled {
+			break
+		}
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			name = strings.TrimSpace(entry.Alias)
+		}
+		if name == "" {
+			continue
+		}
+		label := entry.Alias
+		if label == "" {
+			label = name
+		}
+		if entry.DisplayName != "" {
+			label = strings.TrimSpace(entry.DisplayName)
+		}
+		defs = append(defs, modelDef{
+			id:          Provider + "/" + name,
+			displayName: label + " via Zen",
+		})
+	}
 	models := make([]pluginapi.ModelInfo, 0, len(defs))
 	for _, def := range defs {
 		models = append(models, pluginapi.ModelInfo{

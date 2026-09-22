@@ -32,7 +32,7 @@ const (
 
 // pluginVersion tracks the release; cmd/zen/abi.go carries its own copy for
 // registration metadata (injected via ldflags at release time).
-var pluginVersion = "0.1.0"
+var pluginVersion = "0.2.0"
 
 // ZenPlugin wires session mapping, model metadata, routing, translation and
 // execution. One handler backs every capability.

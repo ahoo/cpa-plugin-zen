@@ -6,7 +6,7 @@
       "name": "Zen Suite",
       "description": "OpenCode Zen suite: client session forwarding for sticky routing plus direct paid-key providers (SystemOne Jev chat wrapper). Free-tier pools arrive separately and never share paid keys.",
       "author": "ahoo",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "repository": "https://github.com/ahoo/cpa-plugin-zen",
       "homepage": "https://github.com/ahoo/cpa-plugin-zen",
       "license": "MIT",

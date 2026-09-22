@@ -5,7 +5,7 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_NAME="zen"
-PLUGIN_VERSION="${PLUGIN_VERSION:-0.1.0}"
+PLUGIN_VERSION="${PLUGIN_VERSION:-0.2.0}"
 OUT_DIR="${PLUGIN_OUT_DIR:-${SRC_DIR}/../../plugins/linux/amd64}"
 GO_IMAGE="${PLUGIN_GO_IMAGE:-golang:1.26}"
 

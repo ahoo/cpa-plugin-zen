@@ -67,7 +67,7 @@ import (
 
 // pluginVersion is overridden at release build time. build.sh also injects
 // the library package's descriptor version with the same value.
-var pluginVersion = "0.1.0"
+var pluginVersion = "0.2.0"
 
 var abiState = struct {
 	sync.RWMutex

@@ -20,12 +20,27 @@ import (
 // members with proxy_url use a self-built transport. Failover retries
 // 429/5xx/transport errors on the next member.
 type Executor struct {
-	cfg     *pluginConfig
-	keypool *pool
+	cfg      *pluginConfig
+	keypool  *pool
+	sessions *sessionPool
+	egress   *egressPool
 }
 
 func NewExecutor(cfg *pluginConfig) *Executor {
-	return &Executor{cfg: cfg, keypool: newPool()}
+	return &Executor{
+		cfg:      cfg,
+		keypool:  newPool(),
+		sessions: loadSessionPool(sessionPoolPath(cfg)),
+		egress:   newEgressPool(cfg),
+	}
+}
+
+// sessionPoolPath resolves the pool file (absolute or host-relative).
+func sessionPoolPath(cfg *pluginConfig) string {
+	if cfg != nil && strings.TrimSpace(cfg.Free.SessionPool) != "" {
+		return strings.TrimSpace(cfg.Free.SessionPool)
+	}
+	return "plugins/zen-sessions.json"
 }
 
 func (e *Executor) Identifier() string { return Provider }
@@ -93,8 +108,12 @@ func (e *Executor) call(ctx context.Context, req pluginapi.ExecutorRequest) (plu
 	return pluginapi.ExecutorResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "zen executor: all pool members failed"}
 }
 
-// Execute performs a non-streaming call.
+// Execute performs a non-streaming call, routing free models to the free
+// path and everything else to the paid pool.
 func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+	if entry := e.cfg.freeEntry(req.Model); entry != nil {
+		return e.executeFree(ctx, req, *entry)
+	}
 	return e.call(ctx, req)
 }
 
@@ -103,6 +122,9 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 // /v1/messages receives one data: prefix because the host's OpenAI-to-Claude
 // translator consumes SSE-framed input. The host emits its own stream tail.
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
+	if entry := e.cfg.freeEntry(req.Model); entry != nil {
+		return e.executeFreeStream(ctx, req, *entry)
+	}
 	members := e.cfg.members(req)
 	if len(members) == 0 {
 		return pluginapi.ExecutorStreamResponse{}, statusError{statusCode: http.StatusUnauthorized, msg: missingKeyMsg}
