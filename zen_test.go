@@ -454,3 +454,18 @@ func TestEmptyStreamEmitsTerminal(t *testing.T) {
 		t.Fatalf("empty stream must yield exactly one terminal chunk, got %d", n)
 	}
 }
+
+func TestIsEmptyCompletion(t *testing.T) {
+	if !isEmptyCompletion([]byte(`{"choices":[{"message":{"role":"assistant","content":"  "}}]}`)) {
+		t.Fatal("blank content must count as empty")
+	}
+	if isEmptyCompletion([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}]}`)) {
+		t.Fatal("real content must not count as empty")
+	}
+	if isEmptyCompletion([]byte(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"1"}]}}]}`)) {
+		t.Fatal("tool calls must not count as empty")
+	}
+	if isEmptyCompletion([]byte(`not-json`)) {
+		t.Fatal("unparseable must fail open (non-empty)")
+	}
+}

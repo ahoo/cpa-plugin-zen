@@ -804,8 +804,37 @@ func (e *Executor) executeFree(ctx context.Context, req pluginapi.ExecutorReques
 	if mapErr != nil {
 		return pluginapi.ExecutorResponse{}, statusError{statusCode: http.StatusBadGateway, msg: mapErr.Error()}
 	}
+	if isEmptyCompletion(mapped) && e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
+		fbBody, fbHeaders, _, fbErr := e.paidFallback(ctx, req, nil)
+		if fbErr != nil {
+			return pluginapi.ExecutorResponse{}, fbErr
+		}
+		return pluginapi.ExecutorResponse{Payload: fbBody, Headers: fbHeaders}, nil
+	}
 	_ = endpoint
 	return pluginapi.ExecutorResponse{Payload: mapped, Headers: headers}, nil
+}
+
+// isEmptyCompletion reports whether an assembled OpenAI completion carries
+// no text and no tool calls (free-tier silent degradation). It never fails:
+// unparseable bodies are treated as non-empty and surface normally.
+func isEmptyCompletion(mapped []byte) bool {
+	var decoded struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []any  `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(mapped, &decoded); err != nil {
+		return false
+	}
+	if len(decoded.Choices) == 0 {
+		return false
+	}
+	return strings.TrimSpace(decoded.Choices[0].Message.Content) == "" &&
+		len(decoded.Choices[0].Message.ToolCalls) == 0
 }
 
 // executeFreeStream runs the free path and converts upstream SSE to OpenAI
