@@ -21,13 +21,16 @@ TIMEOUT = 150
 API_KEY = os.environ.get("E2E_API_KEY", "")
 
 
-def post_chat(base, model, prompt=PROMPT, max_tokens=32, stream=False, headers=None):
+def post_chat(base, model, prompt=PROMPT, max_tokens=32, stream=False, headers=None, tools=None):
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": stream,
     }
+    if tools is not None:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
     data = json.dumps(body).encode()
     hdrs = {"Content-Type": "application/json", **(headers or {})}
     if API_KEY:
@@ -181,7 +184,61 @@ def case8(base):
     return True, f"3x200 ok, echo unobservable (host strips headers): {got}"
 
 
-CASES = {1: case1, 2: case2, 3: case3, 4: case4, 5: case5, 6: case6, 7: case7, 8: case8}
+PROBE_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "e2e_probe_tool",
+        "description": "e2e probe tool, never actually called",
+        "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+    },
+}]
+
+
+def case9(base):
+    """Chat SSE streaming: mimo-free stream yields chunks + [DONE] + text."""
+    st, h, raw = post_chat(base, "mimo-free", stream=True)
+    t = sse_text_of(raw)
+    done = "[DONE]" in raw
+    chunks = sum(1 for ln in raw.splitlines() if ln.strip().startswith("data:"))
+    if st == 200 and t and done and chunks >= 2:
+        return True, f"200 chunks={chunks} text={t[:40]!r}"
+    return False, f"status={st} chunks={chunks} done={done} text={t[:60]!r} raw={raw[:200]!r}"
+
+
+def case10(base):
+    """Tools passthrough (paid): deepseek-flash accepts tools, shape valid."""
+    st, h, raw = post_chat(base, "deepseek-flash", tools=PROBE_TOOL)
+    try:
+        j = json.loads(raw)
+        ch = (j.get("choices") or [{}])[0]
+        tc = (ch.get("message") or {}).get("tool_calls")
+        txt = ((ch.get("message") or {}).get("content") or "").strip()
+    except Exception:
+        return False, f"status={st} unparsable raw={raw[:200]!r}"
+    if st == 200 and (tc or txt):
+        kind = f"tool_calls={len(tc)}" if tc else f"text={txt[:40]!r}"
+        return True, f"200 {kind}"
+    return False, f"status={st} raw={raw[:200]!r}"
+
+
+def case11(base):
+    """Tools on free tier: mimo-free + tools survives cloak merge (200)."""
+    st, h, raw = post_chat(base, "mimo-free", tools=PROBE_TOOL)
+    t = text_of(raw)
+    try:
+        j = json.loads(raw)
+        ch = (j.get("choices") or [{}])[0]
+        tc = (ch.get("message") or {}).get("tool_calls")
+    except Exception:
+        tc = None
+    if st == 200 and (t or tc):
+        kind = f"tool_calls={len(tc)}" if tc else f"text={t[:40]!r}"
+        return True, f"200 {kind}"
+    return False, f"status={st} raw={raw[:200]!r}"
+
+
+CASES = {1: case1, 2: case2, 3: case3, 4: case4, 5: case5, 6: case6, 7: case7, 8: case8,
+         9: case9, 10: case10, 11: case11}
 
 
 def main():

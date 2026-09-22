@@ -22,7 +22,14 @@ BASE=http://host:8317 ./run.sh --quick
 | 5 | `muse-free` responses mapping (stream) | SSE text non-empty |
 | 6 | paid isolation (`deepseek-flash` x2) | no pool echo |
 | 7 | unknown model | 4xx fail-closed |
-| 8 | stickiness x3 (same pinned session) | identical echo header |
+| 8 | stickiness x3 (same pinned session) | 3x200 (echo stripped by host, see note) |
+| 9 | chat SSE (`mimo-free` stream) | chunks + `[DONE]` + text |
+| 10 | tools passthrough paid (`deepseek-flash` + tool) | 200, tool_calls or text |
+| 11 | tools on free tier (`mimo-free` + tool, cloak merge) | 200, shape valid |
+
+> Host strips custom plugin response headers (proven 2026-09-23), so cases
+> 2/8 assert availability; stickiness is unit-tested. Cases 1..8 ~12 min,
+> full 1..11 ~16 min.
 
 ## Verdicts
 

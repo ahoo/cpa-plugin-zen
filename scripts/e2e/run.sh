@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 if [[ -z "$CASES" ]]; then
-  if [[ "$QUICK" == "1" ]]; then CASES="1 2 6"; else CASES="1 2 3 4 5 6 7 8"; fi
+  if [[ "$QUICK" == "1" ]]; then CASES="1 2 6"; else CASES="1 2 3 4 5 6 7 8 9 10 11"; fi
 fi
 DIR="$(cd "$(dirname "$0")" && pwd)"
 RESTARTS_BEFORE=""
