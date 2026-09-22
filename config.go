@@ -210,7 +210,7 @@ func defaultModelEntries() []ModelEntry {
 }
 
 // defaultFreeModels are the built-in free aliases. jev-free moved here from
-// paid: free-first with paid fallback beats paid-only.
+// paid: direct paid-key models live here; free models resolve via the free block.
 func defaultFreeModels() []FreeModelEntry {
 	return []FreeModelEntry{
 		{Alias: "mimo-free", Name: "mimo-v2.6-flash-free", Endpoint: "chat"},
