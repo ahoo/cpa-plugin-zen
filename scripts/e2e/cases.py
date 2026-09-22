@@ -207,7 +207,7 @@ def case9(base):
 
 def case10(base):
     """Tools passthrough (paid): deepseek-flash accepts tools, shape valid."""
-    st, h, raw = post_chat(base, "deepseek-flash", tools=PROBE_TOOL)
+    st, h, raw = post_chat(base, "deepseek-flash", tools=PROBE_TOOL, max_tokens=128)
     try:
         j = json.loads(raw)
         ch = (j.get("choices") or [{}])[0]
@@ -223,7 +223,7 @@ def case10(base):
 
 def case11(base):
     """Tools on free tier: mimo-free + tools survives cloak merge (200)."""
-    st, h, raw = post_chat(base, "mimo-free", tools=PROBE_TOOL)
+    st, h, raw = post_chat(base, "mimo-free", tools=PROBE_TOOL, max_tokens=128)
     t = text_of(raw)
     try:
         j = json.loads(raw)
