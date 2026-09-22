@@ -843,6 +843,12 @@ func mergeTools(existing []any, cloak []map[string]any, minTools int) []any {
 func (e *Executor) executeFree(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) (pluginapi.ExecutorResponse, error) {
 	body, headers, endpoint, err := e.freeCall(ctx, req, entry)
 	if err != nil {
+		// Free hard failure: paid fallback before surfacing anything.
+		if e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
+			if fbBody, fbHeaders, _, fbErr := e.paidFallback(ctx, req, err); fbErr == nil {
+				return pluginapi.ExecutorResponse{Payload: fbBody, Headers: fbHeaders}, nil
+			}
+		}
 		return pluginapi.ExecutorResponse{}, err
 	}
 	var mapped []byte
@@ -858,8 +864,37 @@ func (e *Executor) executeFree(ctx context.Context, req pluginapi.ExecutorReques
 	if mapErr != nil {
 		return pluginapi.ExecutorResponse{}, statusError{statusCode: http.StatusBadGateway, msg: mapErr.Error()}
 	}
+	if isEmptyCompletion(mapped) && e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
+		fbBody, fbHeaders, _, fbErr := e.paidFallback(ctx, req, nil)
+		if fbErr != nil {
+			return pluginapi.ExecutorResponse{}, fbErr
+		}
+		return pluginapi.ExecutorResponse{Payload: fbBody, Headers: fbHeaders}, nil
+	}
 	_ = endpoint
 	return pluginapi.ExecutorResponse{Payload: mapped, Headers: headers}, nil
+}
+
+// isEmptyCompletion reports whether an assembled OpenAI completion carries
+// no text and no tool calls (free-tier silent degradation). It never fails:
+// unparseable bodies are treated as non-empty and surface normally.
+func isEmptyCompletion(mapped []byte) bool {
+	var decoded struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []any  `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(mapped, &decoded); err != nil {
+		return false
+	}
+	if len(decoded.Choices) == 0 {
+		return false
+	}
+	return strings.TrimSpace(decoded.Choices[0].Message.Content) == "" &&
+		len(decoded.Choices[0].Message.ToolCalls) == 0
 }
 
 // executeFreeStream runs the free path and converts upstream SSE to OpenAI
@@ -869,7 +904,30 @@ func (e *Executor) executeFree(ctx context.Context, req pluginapi.ExecutorReques
 func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) (pluginapi.ExecutorStreamResponse, error) {
 	body, headers, _, err := e.freeCall(ctx, req, entry)
 	if err != nil {
-		return pluginapi.ExecutorStreamResponse{}, err
+		// Free hard failure on a stream: answer via paid fallback chunks
+		// rather than closing bare (downstream reads that as transport
+		// failure). Final resort is a graceful terminal chunk.
+		if e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
+			if fbBody, _, _, fbErr := e.paidFallback(ctx, req, err); fbErr == nil {
+				framing := framingForRequest(req)
+				ch := make(chan pluginapi.ExecutorStreamChunk, 8)
+				go func() {
+					defer close(ch)
+					for _, piece := range chunkCompletion(req.Model, fbBody, framing) {
+						select {
+						case <-ctx.Done():
+							return
+						case ch <- pluginapi.ExecutorStreamChunk{Payload: piece}:
+						}
+					}
+				}()
+				return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: ch}, nil
+			}
+		}
+		ch := make(chan pluginapi.ExecutorStreamChunk, 1)
+		ch <- pluginapi.ExecutorStreamChunk{Payload: terminalChunk(req.Model, framingForRequest(req))}
+		close(ch)
+		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: ch}, nil
 	}
 	kind := strings.ToLower(strings.TrimSpace(entry.Endpoint))
 	if kind == "systemone" {
@@ -892,7 +950,132 @@ func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.Executor
 	} else {
 		base = convertResponsesSSE(ctx, body, framingForRequest(req))
 	}
-	return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: base}, nil
+	if !e.cfg.Free.Quota.FailoverPaid || strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) == "" {
+		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: base}, nil
+	}
+	return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: e.streamWithPaidFallback(ctx, req, base, framingForRequest(req))}, nil
+}
+
+// terminalChunk builds a graceful stream end carrying the model identity so
+// downstream never sees a bare stream end as a transport error.
+func terminalChunk(model string, framing streamFraming) []byte {
+	raw, _ := json.Marshal(map[string]any{
+		"model":   model,
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+	})
+	if framing == framingClaude {
+		return append([]byte("data: "), raw...)
+	}
+	return raw
+}
+
+// When the stream ends empty (free-tier silent degradation), it runs the
+// paid fallback and emits its answer as stream chunks instead.
+// streamWithPaidFallback relays upstream chunks, counting data payloads.
+// When the stream ends empty (free-tier silent degradation), it runs the
+// paid fallback and emits its answer as stream chunks instead.
+func (e *Executor) streamWithPaidFallback(ctx context.Context, req pluginapi.ExecutorRequest, base <-chan pluginapi.ExecutorStreamChunk, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
+	out := make(chan pluginapi.ExecutorStreamChunk, 8)
+	go func() {
+		defer close(out)
+		count := 0
+		for chunk := range base {
+			if chunk.Err != nil {
+				select {
+				case <-ctx.Done():
+				case out <- chunk:
+				}
+				return
+			}
+			if len(bytes.TrimSpace(chunk.Payload)) > 0 {
+				count++
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case out <- chunk:
+			}
+		}
+		if count > 0 || ctx.Err() != nil {
+			return
+		}
+		fbBody, _, _, fbErr := e.paidFallback(ctx, req, nil)
+		if fbErr != nil {
+			// Nothing to deliver: emit one terminal chunk with the model
+			// set so downstream completes gracefully instead of erroring
+			// on a bare stream end.
+			terminal, _ := json.Marshal(map[string]any{
+				"model":   req.Model,
+				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+			})
+			if framing == framingClaude {
+				terminal = append([]byte("data: "), terminal...)
+			}
+			select {
+			case <-ctx.Done():
+			case out <- pluginapi.ExecutorStreamChunk{Payload: terminal}:
+			}
+			return
+		}
+		for _, piece := range chunkCompletion(req.Model, fbBody, framing) {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- pluginapi.ExecutorStreamChunk{Payload: piece}:
+			}
+		}
+	}()
+	return out
+}
+
+// chunkCompletion splits a non-stream OpenAI completion into stream deltas.
+func chunkCompletion(model string, fbBody []byte, framing streamFraming) [][]byte {
+	var decoded struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []any  `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(fbBody, &decoded); err != nil || len(decoded.Choices) == 0 {
+		return nil
+	}
+	content := decoded.Choices[0].Message.Content
+	var pieces [][]byte
+	enc := func(payload []byte) []byte {
+		if framing == framingClaude {
+			return append([]byte("data: "), payload...)
+		}
+		return payload
+	}
+	if content != "" {
+		for i := 0; i < len(content); i += 500 {
+			end := i + 500
+			if end > len(content) {
+				end = len(content)
+			}
+			raw, _ := json.Marshal(map[string]any{
+				"model":   model,
+				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": content[i:end]}}},
+			})
+			pieces = append(pieces, enc(raw))
+		}
+	}
+	if len(decoded.Choices[0].Message.ToolCalls) > 0 {
+		raw, _ := json.Marshal(map[string]any{
+			"model":   model,
+			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": decoded.Choices[0].Message.ToolCalls}}},
+		})
+		pieces = append(pieces, enc(raw))
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"model":   model,
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+	})
+	pieces = append(pieces, enc(raw))
+	return pieces
 }
 
 // freeCall performs member×session failover and returns one successful
@@ -942,6 +1125,9 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 		if attempts >= 8 {
 			break
 		}
+	}
+	if e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
+		return e.paidFallback(ctx, req, lastErr)
 	}
 	if lastErr != nil {
 		return nil, nil, "", lastErr
@@ -1000,6 +1186,63 @@ func (e *Executor) coolFree(session string, memberIdx int, cooldown int) {
 	if memberIdx >= 0 {
 		e.freepool.cool(memberIdx, cooldown)
 	}
+}
+
+// paidFallback re-dispatches as a paid chat request for the configured
+// fallback model (upstream chat model name, used verbatim).
+func (e *Executor) paidFallback(ctx context.Context, req pluginapi.ExecutorRequest, freeErr error) ([]byte, http.Header, string, error) {
+	fallback := strings.TrimSpace(e.cfg.Free.Quota.PaidFallback)
+	members := e.cfg.members(req)
+	if len(members) == 0 {
+		if freeErr != nil {
+			return nil, nil, "", freeErr
+		}
+		return nil, nil, "", statusError{statusCode: http.StatusUnauthorized, msg: missingKeyMsg}
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(requestPayload(req), &decoded); err != nil {
+		return nil, nil, "", statusError{statusCode: http.StatusBadRequest, msg: "zen free executor: invalid chat payload"}
+	}
+	decoded["model"] = fallback
+	if floor := float64(e.cfg.fallbackFloor()); floor > 0 {
+		if mt, ok := decoded["max_tokens"].(float64); !ok || mt < floor {
+			decoded["max_tokens"] = floor
+		}
+	}
+	body, err := json.Marshal(decoded)
+	if err != nil {
+		return nil, nil, "", statusError{statusCode: http.StatusBadGateway, msg: err.Error()}
+	}
+	url := strings.TrimSuffix(e.cfg.baseURL(), "/") + "/v1/chat/completions"
+	var lastErr error = freeErr
+	for _, idx := range e.keypool.order(members) {
+		m := members[idx]
+		d, err := e.keypool.clientFor(idx, m, req.HTTPClient)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		status, headers, respBody, err := d.do(ctx, url, upstreamHeaders(strings.TrimSpace(m.Key)), body)
+		if err != nil {
+			lastErr = err
+			if retryable(0, err) && ctx.Err() == nil {
+				continue
+			}
+			return nil, nil, "", err
+		}
+		if status < 200 || status >= 300 {
+			lastErr = statusError{statusCode: status, body: respBody}
+			if retryable(status, nil) && ctx.Err() == nil {
+				continue
+			}
+			return nil, nil, "", lastErr
+		}
+		return respBody, headers, "chat", nil
+	}
+	if lastErr != nil {
+		return nil, nil, "", lastErr
+	}
+	return nil, nil, "", statusError{statusCode: http.StatusBadGateway, msg: "zen paid fallback: all pool members failed"}
 }
 
 // freeRetryable reports whether a free-tier failure is worth rotating to
@@ -1074,7 +1317,9 @@ func forwardChatSSE(ctx context.Context, sse []byte, framing streamFraming) <-ch
 }
 
 // convertResponsesSSE converts Responses SSE to OpenAI deltas incrementally.
-// Empty upstream yields an empty channel.
+// Empty upstream yields an empty channel; the streamWithPaidFallback wrapper
+// owns the empty policy (do not emit terminal chunks here, they would mask
+// the fallback trigger as delivered data).
 func convertResponsesSSE(ctx context.Context, sse []byte, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk, 8)
 	go func() {

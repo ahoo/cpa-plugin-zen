@@ -18,7 +18,7 @@ type pluginConfig struct {
 	// never share these keys.
 	Paid paidConfig `yaml:"paid"`
 	// Free carries anonymous free-tier models with per-endpoint cloak,
-	// egress pool with cooldown. Never uses paid keys.
+	// egress pool and quota fallback. Never uses paid keys.
 	Free freeConfig `yaml:"free"`
 
 	// Derived indexes (see buildIndexes). Not YAML fields.
@@ -183,9 +183,21 @@ type cloakConfig struct {
 	Tools    []map[string]any `yaml:"tools"`
 }
 
-// quotaConfig governs free-pool cooldowns.
+// quotaConfig governs free-pool cooldown and paid fallback.
 type quotaConfig struct {
-	Cooldown int `yaml:"cooldown"` // seconds a failed member/session cools down
+	Cooldown     int    `yaml:"cooldown"` // seconds a failed member/session cools down
+	FailoverPaid bool   `yaml:"failover_paid"`
+	PaidFallback string `yaml:"paid_fallback"` // paid model alias used when free is exhausted
+	// FallbackMinTokens floors the output budget on fallback calls: tiny
+	// budgets burn out on thinking models and return empty. Default 512.
+	FallbackMinTokens int `yaml:"fallback_min_tokens"`
+}
+
+func (c *pluginConfig) fallbackFloor() int {
+	if c != nil && c.Free.Quota.FallbackMinTokens > 0 {
+		return c.Free.Quota.FallbackMinTokens
+	}
+	return 512
 }
 
 func (c *pluginConfig) cooldown() int {
@@ -210,7 +222,7 @@ func defaultModelEntries() []ModelEntry {
 }
 
 // defaultFreeModels are the built-in free aliases. jev-free moved here from
-// paid: direct paid-key models live here; free models resolve via the free block.
+// paid: free-first with paid fallback beats paid-only.
 func defaultFreeModels() []FreeModelEntry {
 	return []FreeModelEntry{
 		{Alias: "mimo-free", Name: "mimo-v2.6-flash-free", Endpoint: "chat"},
