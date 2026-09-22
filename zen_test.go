@@ -558,3 +558,14 @@ func TestStreamFallbackOnEmpty(t *testing.T) {
 		t.Fatalf("terminal chunk wrong: %+v", decoded)
 	}
 }
+
+func TestFallbackFloor(t *testing.T) {
+	cfg := parseConfig([]byte("paid:\n  api_keys:\n    - key: sk-x\nfree:\n  enabled: true\n  quota:\n    failover_paid: true\n    paid_fallback: deepseek-v4.1-flash\n    fallback_min_tokens: 512\n"))
+	if cfg.fallbackFloor() != 512 {
+		t.Fatalf("floor = %d", cfg.fallbackFloor())
+	}
+	def := parseConfig([]byte("paid:\n  api_keys:\n    - key: sk-x\n"))
+	if def.fallbackFloor() != 512 {
+		t.Fatalf("default floor = %d", def.fallbackFloor())
+	}
+}

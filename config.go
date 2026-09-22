@@ -188,6 +188,16 @@ type quotaConfig struct {
 	Cooldown     int    `yaml:"cooldown"` // seconds a failed member/session cools down
 	FailoverPaid bool   `yaml:"failover_paid"`
 	PaidFallback string `yaml:"paid_fallback"` // paid model alias used when free is exhausted
+	// FallbackMinTokens floors the output budget on fallback calls: tiny
+	// budgets burn out on thinking models and return empty. Default 512.
+	FallbackMinTokens int `yaml:"fallback_min_tokens"`
+}
+
+func (c *pluginConfig) fallbackFloor() int {
+	if c != nil && c.Free.Quota.FallbackMinTokens > 0 {
+		return c.Free.Quota.FallbackMinTokens
+	}
+	return 512
 }
 
 func (c *pluginConfig) cooldown() int {

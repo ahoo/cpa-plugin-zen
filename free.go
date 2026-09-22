@@ -1160,6 +1160,11 @@ func (e *Executor) paidFallback(ctx context.Context, req pluginapi.ExecutorReque
 		return nil, nil, "", statusError{statusCode: http.StatusBadRequest, msg: "zen free executor: invalid chat payload"}
 	}
 	decoded["model"] = fallback
+	if floor := float64(e.cfg.fallbackFloor()); floor > 0 {
+		if mt, ok := decoded["max_tokens"].(float64); !ok || mt < floor {
+			decoded["max_tokens"] = floor
+		}
+	}
 	body, err := json.Marshal(decoded)
 	if err != nil {
 		return nil, nil, "", statusError{statusCode: http.StatusBadGateway, msg: err.Error()}
