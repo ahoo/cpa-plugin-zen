@@ -7,7 +7,7 @@ prefixed `e2e-probe` so upstream spend is identifiable.
 
 ```bash
 ./run.sh --quick          # cases 1 2 6, ~2 min, pre/post-restart smoke
-./run.sh                  # full 1..8, ~12 min
+./run.sh                  # full 1..11, ~16 min
 BASE=http://host:8317 ./run.sh --quick
 ```
 
@@ -43,5 +43,5 @@ BASE=http://host:8317 ./run.sh --quick
 
 ## Cost ceiling
 
-`max_tokens=32` per call, ≤ 24 calls full suite. Worst case is cents; paid
+`max_tokens=32` per call (128 for tool cases), ≤ 33 calls full suite. Worst case is cents; paid
 fallback may answer free-tier cases and that is by design (still PASS).

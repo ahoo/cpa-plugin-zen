@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Zen plugin e2e runner. Quick (cases 1 2 6, ~2min) or full (1..8, ~12min).
+# Zen plugin e2e runner. Quick (cases 1 2 6, ~2min) or full (1..11, ~16min).
 # Per-case failure retries 2x with 30s interval; outcome is tri-state:
 #   PASS       - green first try
 #   FLAKE-WARN - failed then recovered on retry (free tier flakiness, expected)
