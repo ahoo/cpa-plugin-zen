@@ -98,8 +98,11 @@ def case2(base):
     st, h, raw = post_chat(base, "mimo-free")
     t = text_of(raw)
     sess = hdr(h, POOL_HDR)
+    fb = hdr(h, "X-Zen-Fallback")
     if st == 200 and t and sess:
         return True, f"200 session={sess} text={t[:40]!r}"
+    if st == 200 and t and fb:
+        return False, f"free tier down, paid fallback served (marker={fb})"
     if st == 200 and t and not sess:
         return False, "200 with text but no X-Zen-Pool-Session echo (plugin older than 0bc9bec?)"
     return False, f"status={st} text={t[:80]!r} raw={raw[:200]!r}"
