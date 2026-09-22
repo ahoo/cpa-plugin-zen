@@ -273,7 +273,7 @@ func (p *freePool) clientFor(idx int, hostClient pluginapi.HostHTTPClient) (doer
 	if err != nil {
 		return nil, err
 	}
-	c := &http.Client{Transport: transport, Timeout: 100 * time.Second}
+	c := &http.Client{Transport: transport, Timeout: 20 * time.Second}
 	p.clients[idx] = c
 	return stdDoer{client: c}, nil
 }
@@ -925,13 +925,19 @@ func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.Executor
 func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) ([]byte, http.Header, string, error) {
 	cooldown := e.cfg.cooldown()
 	var lastErr error
-	sessions := e.freeSessions(entry, req)
+	sessions := e.freeSessions(entry)
 	order := e.freepool.order()
 	attempts := 0
+	consecutive := 0
 	for _, mi := range order {
 		m := e.freepool.members[mi]
 		for _, s := range sessions {
 			if attempts >= 8 {
+				break
+			}
+			// Three straight failures means the free tier is down, not
+			// flaky: stop burning timeouts and fall through to paid.
+			if consecutive >= 3 {
 				break
 			}
 			attempts++
@@ -940,6 +946,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 				lastErr = err
 				if freeRetryable(0, err) && ctx.Err() == nil {
 					e.coolFree(s, mi, cooldown)
+					consecutive++
 					continue
 				}
 				return nil, nil, "", err
@@ -948,6 +955,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 				lastErr = statusError{statusCode: status, body: respBody}
 				if (freeRetryable(status, nil) || freeBodyRetryable(respBody)) && ctx.Err() == nil {
 					e.coolFree(s, mi, cooldown)
+					consecutive++
 					continue
 				}
 				return nil, nil, "", lastErr
