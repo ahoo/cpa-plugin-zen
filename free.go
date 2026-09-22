@@ -135,7 +135,8 @@ func (p *sessionPool) report(id string, ok bool, cooldownSec int) {
 // egressPool rotates exit proxies for free traffic (trial quota is
 // IP-bound). Cooldowns live in memory; disabled members are filtered at
 // build time.
-type egressMember struct {
+type freeLiveMember struct {
+	key           string
 	url           string
 	weight        int
 	idx           int
@@ -143,30 +144,30 @@ type egressMember struct {
 	fails         int
 }
 
-type egressPool struct {
+type freePool struct {
 	mu      sync.Mutex
 	rnd     *lockedRand
-	members []egressMember
+	members []freeLiveMember
 	clients map[int]*http.Client
 }
 
-func newEgressPool(cfg *pluginConfig) *egressPool {
-	p := &egressPool{rnd: &lockedRand{}, clients: map[int]*http.Client{}}
+func newFreePool(cfg *pluginConfig) *freePool {
+	p := &freePool{rnd: &lockedRand{}, clients: map[int]*http.Client{}}
 	if cfg == nil {
 		return p
 	}
-	for i, en := range cfg.Free.Egress {
-		if strings.TrimSpace(en.URL) == "" || en.Disabled {
+	for i, en := range cfg.Free.Members {
+		if en.Disabled {
 			continue
 		}
-		p.members = append(p.members, egressMember{url: strings.TrimSpace(en.URL), weight: en.normWeight(), idx: i})
+		p.members = append(p.members, freeLiveMember{key: en.authKey(), url: strings.TrimSpace(en.ProxyURL), weight: en.normWeight(), idx: i})
 	}
 	return p
 }
 
 // order returns member indices in weighted-random order, skipping cooled
 // down members (they rejoin automatically on expiry).
-func (p *egressPool) order() []int {
+func (p *freePool) order() []int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -198,7 +199,7 @@ func (p *egressPool) order() []int {
 	return out
 }
 
-func (p *egressPool) cool(idx int, cooldownSec int) {
+func (p *freePool) cool(idx int, cooldownSec int) {
 	if cooldownSec <= 0 {
 		cooldownSec = 300
 	}
@@ -210,7 +211,7 @@ func (p *egressPool) cool(idx int, cooldownSec int) {
 	}
 }
 
-func (p *egressPool) clientFor(idx int, hostClient pluginapi.HostHTTPClient) (doer, error) {
+func (p *freePool) clientFor(idx int, hostClient pluginapi.HostHTTPClient) (doer, error) {
 	if idx < 0 {
 		if hostClient == nil {
 			return nil, fmt.Errorf("zen free executor: host HTTP client is required")
@@ -255,13 +256,17 @@ func (r *lockedRand) intn(n int) int {
 	return r.rnd.Intn(n)
 }
 
-// freeHeaders builds the genuine-CLI header set for anonymous free calls.
-// Empty session omits session/request IDs (validated anonymous shape).
-func freeHeaders(sessionID string) http.Header {
+// freeHeaders builds the genuine-CLI header set for free calls. Empty key
+// selects the anonymous tier (Bearer public); otherwise the logged-in key.
+func freeHeaders(sessionID, key string) http.Header {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "*/*")
-	h.Set("Authorization", "Bearer public")
+	if strings.TrimSpace(key) == "" {
+		h.Set("Authorization", "Bearer public")
+	} else {
+		h.Set("Authorization", "Bearer "+strings.TrimSpace(key))
+	}
 	h.Set("User-Agent", "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
 	h.Set("X-Opencode-Client", "cli")
 	h.Set("X-Opencode-Project", "global")
@@ -681,7 +686,7 @@ func freeUpstreamPath(endpoint string) string {
 
 // freeAttempt performs one (session, egress) upstream call. It returns the
 // raw upstream body for the caller to map.
-func (e *Executor) freeAttempt(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry, session, egressURL string, egressIdx int) (int, http.Header, []byte, error) {
+func (e *Executor) freeAttempt(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry, session string, member freeLiveMember, memberIdx int) (int, http.Header, []byte, error) {
 	base := strings.TrimSuffix(e.cfg.baseURL(), "/")
 	url := base + freeUpstreamPath(entry.Endpoint)
 	tools := cloakTools(e.cfg)
@@ -713,15 +718,16 @@ func (e *Executor) freeAttempt(ctx context.Context, req pluginapi.ExecutorReques
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	headers := freeHeaders(session)
+	headers := freeHeaders(session, member.key)
 	var d doer
-	if strings.TrimSpace(egressURL) == "" {
+	if strings.TrimSpace(member.url) == "" {
 		if req.HTTPClient == nil {
 			return 0, nil, nil, fmt.Errorf("zen free executor: host HTTP client is required")
 		}
 		d = hostDoer{client: req.HTTPClient}
 	} else {
-		d, err = e.egress.clientFor(egressIdx, req.HTTPClient)
+		var err error
+		d, err = e.freepool.clientFor(memberIdx, req.HTTPClient)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -814,32 +820,27 @@ func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.Executor
 	return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: convertResponsesSSE(ctx, body, framingForRequest(req))}, nil
 }
 
-// freeCall performs session×egress failover and returns one successful
-// upstream response body.
+// freeCall performs member×session failover and returns one successful
+// upstream response body. Each member already couples one identity with one
+// egress, mirroring the opencode provider entries.
 func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) ([]byte, http.Header, string, error) {
 	cooldown := e.cfg.cooldown()
 	var lastErr error
 	sessions := e.freeSessions(entry)
-	egressOrder := e.egress.order()
-	if len(egressOrder) == 0 && len(e.egress.members) == 0 {
-		egressOrder = []int{-1}
-	}
+	order := e.freepool.order()
 	attempts := 0
-	for _, s := range sessions {
-		for _, ei := range egressOrder {
-			if attempts >= 6 {
+	for _, mi := range order {
+		m := e.freepool.members[mi]
+		for _, s := range sessions {
+			if attempts >= 8 {
 				break
 			}
 			attempts++
-			var eurl string
-			if ei >= 0 {
-				eurl = e.egress.members[ei].url
-			}
-			status, headers, respBody, err := e.freeAttempt(ctx, req, entry, s, eurl, ei)
+			status, headers, respBody, err := e.freeAttempt(ctx, req, entry, s, m, mi)
 			if err != nil {
 				lastErr = err
 				if retryable(0, err) && ctx.Err() == nil {
-					e.coolFree(s, ei, cooldown)
+					e.coolFree(s, mi, cooldown)
 					continue
 				}
 				return nil, nil, "", err
@@ -847,13 +848,16 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 			if status < 200 || status >= 300 {
 				lastErr = statusError{statusCode: status, body: respBody}
 				if retryable(status, nil) && ctx.Err() == nil {
-					e.coolFree(s, ei, cooldown)
+					e.coolFree(s, mi, cooldown)
 					continue
 				}
 				return nil, nil, "", lastErr
 			}
 			e.sessions.report(s, true, 0)
 			return respBody, headers, strings.ToLower(strings.TrimSpace(entry.Endpoint)), nil
+		}
+		if attempts >= 8 {
+			break
 		}
 	}
 	if e.cfg.Free.Quota.FailoverPaid && strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) != "" {
@@ -862,7 +866,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 	if lastErr != nil {
 		return nil, nil, "", lastErr
 	}
-	return nil, nil, "", statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: no healthy session or egress"}
+	return nil, nil, "", statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: no healthy session or member"}
 }
 
 // freeSessions returns candidate session IDs (empty for systemone, which
@@ -890,12 +894,12 @@ func (e *Executor) freeSessions(entry FreeModelEntry) []string {
 	return out
 }
 
-func (e *Executor) coolFree(session string, egressIdx int, cooldown int) {
+func (e *Executor) coolFree(session string, memberIdx int, cooldown int) {
 	if session != "" {
 		e.sessions.report(session, false, cooldown)
 	}
-	if egressIdx >= 0 {
-		e.egress.cool(egressIdx, cooldown)
+	if memberIdx >= 0 {
+		e.freepool.cool(memberIdx, cooldown)
 	}
 }
 

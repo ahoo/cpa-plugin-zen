@@ -127,22 +127,48 @@ type APIKeyEntry struct {
 	ProxyURL string `yaml:"proxy_url"`
 }
 
-// freeConfig is the anonymous free-tier pool.
+// freeConfig is the free-tier pool: mirrors the opencode provider entry
+// shape ({key, proxy_url} pairs) so the established key/proxy mapping is
+// reused instead of maintained twice.
 type freeConfig struct {
 	Enabled     bool             `yaml:"enabled"`
 	Models      []FreeModelEntry `yaml:"models"`
 	Cloak       cloakConfig      `yaml:"cloak"`
-	Egress      []EgressEntry    `yaml:"egress"`
+	Members     []FreeMember     `yaml:"members"`
 	Quota       quotaConfig      `yaml:"quota"`
 	SessionPool string           `yaml:"session_pool"`
 }
 
+// FreeMember is one free identity×egress pair, mirroring an
+// openai-compatibility api-key-entry. Key "public" (or empty) selects the
+// anonymous tier; anything else is a logged-in free identity.
+type FreeMember struct {
+	Key      string `yaml:"key"`
+	ProxyURL string `yaml:"proxy_url"`
+	Weight   int    `yaml:"weight"`
+	Disabled bool   `yaml:"disabled"`
+}
+
+func (en FreeMember) normWeight() int {
+	if en.Weight <= 0 {
+		return 1
+	}
+	return en.Weight
+}
+
+func (en FreeMember) authKey() string {
+	if strings.TrimSpace(en.Key) == "" || strings.EqualFold(strings.TrimSpace(en.Key), "public") {
+		return ""
+	}
+	return strings.TrimSpace(en.Key)
+}
+
 // FreeModelEntry maps a client alias to an upstream free model + endpoint.
 type FreeModelEntry struct {
-	Alias       string                `yaml:"alias"`
-	Name        string                `yaml:"name"`
-	Endpoint    string                `yaml:"endpoint"` // chat|responses|systemone
-	DisplayName string                `yaml:"display_name"`
+	Alias       string                 `yaml:"alias"`
+	Name        string                 `yaml:"name"`
+	Endpoint    string                 `yaml:"endpoint"` // chat|responses|systemone
+	DisplayName string                 `yaml:"display_name"`
 	Questions   map[string]QuestionDef `yaml:"questions"`
 }
 
@@ -151,20 +177,6 @@ type cloakConfig struct {
 	Stream   bool             `yaml:"stream"`
 	MinTools int              `yaml:"min_tools"`
 	Tools    []map[string]any `yaml:"tools"`
-}
-
-// EgressEntry is one exit proxy for free traffic (trial quota is IP-bound).
-type EgressEntry struct {
-	URL      string `yaml:"url"`
-	Weight   int    `yaml:"weight"`
-	Disabled bool   `yaml:"disabled"`
-}
-
-func (en EgressEntry) normWeight() int {
-	if en.Weight <= 0 {
-		return 1
-	}
-	return en.Weight
 }
 
 // quotaConfig governs free-pool cooldown and paid fallback.

@@ -23,7 +23,7 @@ type Executor struct {
 	cfg      *pluginConfig
 	keypool  *pool
 	sessions *sessionPool
-	egress   *egressPool
+	freepool *freePool
 }
 
 func NewExecutor(cfg *pluginConfig) *Executor {
@@ -31,7 +31,7 @@ func NewExecutor(cfg *pluginConfig) *Executor {
 		cfg:      cfg,
 		keypool:  newPool(),
 		sessions: loadSessionPool(sessionPoolPath(cfg)),
-		egress:   newEgressPool(cfg),
+		freepool: newFreePool(cfg),
 	}
 }
 

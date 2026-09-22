@@ -342,3 +342,51 @@ func TestSessionPoolLoadAndCooldown(t *testing.T) {
 		t.Fatalf("recovered session not picked: %q", got)
 	}
 }
+
+func TestFreeMembersMirrorOpencodeEntries(t *testing.T) {
+	cfg := parseConfig([]byte(`free:
+  enabled: true
+  members:
+    - key: sk-a
+      proxy_url: http://127.0.0.1:18080
+      weight: 10
+    - key: public
+      proxy_url: http://127.0.0.1:18081
+    - key: sk-dead
+      proxy_url: http://127.0.0.1:18082
+      disabled: true
+`))
+	p := newFreePool(cfg)
+	if len(p.members) != 2 {
+		t.Fatalf("disabled member must be filtered: %+v", p.members)
+	}
+	if p.members[0].key != "sk-a" || p.members[0].url != "http://127.0.0.1:18080" {
+		t.Fatalf("member not mirrored: %+v", p.members[0])
+	}
+	if p.members[1].key != "" {
+		t.Fatalf("public must normalize to anonymous: %q", p.members[1].key)
+	}
+	ord := p.order()
+	if len(ord) != 2 {
+		t.Fatalf("order must cover healthy members: %v", ord)
+	}
+	p.cool(0, 3600)
+	p.cool(1, 3600)
+	if ord := p.order(); len(ord) != 0 {
+		t.Fatalf("cooled pool must yield nothing: %v", ord)
+	}
+}
+
+func TestFreeHeadersAuthModes(t *testing.T) {
+	anon := freeHeaders("ses_x", "")
+	if anon.Get("Authorization") != "Bearer public" {
+		t.Fatalf("anonymous must use public: %q", anon.Get("Authorization"))
+	}
+	keyed := freeHeaders("ses_x", "sk-abc")
+	if keyed.Get("Authorization") != "Bearer sk-abc" {
+		t.Fatalf("keyed auth wrong: %q", keyed.Get("Authorization"))
+	}
+	if h := freeHeaders("", ""); h.Get("X-Opencode-Session") != "" {
+		t.Fatal("empty session must omit session headers")
+	}
+}
