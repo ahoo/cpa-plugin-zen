@@ -946,7 +946,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 			}
 			if status < 200 || status >= 300 {
 				lastErr = statusError{statusCode: status, body: respBody}
-				if freeRetryable(status, nil) && ctx.Err() == nil {
+				if (freeRetryable(status, nil) || freeBodyRetryable(respBody)) && ctx.Err() == nil {
 					e.coolFree(s, mi, cooldown)
 					continue
 				}
@@ -1076,7 +1076,8 @@ func (e *Executor) paidFallback(ctx context.Context, req pluginapi.ExecutorReque
 // freeRetryable reports whether a free-tier failure is worth rotating to
 // the next member/session. Unlike the paid pool, HTTP 403 here is the
 // normal gate/quota signal (FreeTierError), not a malformed request, so it
-// must rotate instead of failing fast.
+// must rotate instead of failing fast. Bodies hinting at transient upstream
+// state (unavailable/overloaded/...) rotate regardless of status.
 func freeRetryable(status int, err error) bool {
 	if err != nil {
 		return true
@@ -1085,6 +1086,28 @@ func freeRetryable(status int, err error) bool {
 		return false
 	}
 	return true
+}
+
+// freeBodyRetryable sniffs response bodies for transient upstream signals
+// that arrive under non-retryable statuses (e.g. endpoint unavailable).
+func freeBodyRetryable(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	lowered := strings.ToLower(string(body))
+	if len(lowered) > 2000 {
+		lowered = lowered[:2000]
+	}
+	for _, hint := range []string{
+		"unavailable", "overloaded", "try again", "capacity",
+		"temporarily", "timeout", "timed out", "busy", "overloaded_error",
+		"rate limit", "rate_limit", "ratelimit", "too many requests",
+	} {
+		if strings.Contains(lowered, hint) {
+			return true
+		}
+	}
+	return false
 }
 func forwardChatSSE(ctx context.Context, sse []byte, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk, 8)

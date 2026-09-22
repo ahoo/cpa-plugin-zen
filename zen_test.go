@@ -517,3 +517,15 @@ func TestInterceptorStampsPoolSession(t *testing.T) {
 		t.Fatalf("non-free request must not be stamped, got %q", got)
 	}
 }
+
+func TestFreeBodyRetryable(t *testing.T) {
+	if !freeBodyRetryable([]byte(`{"error":"Endpoint is unavailable"}`)) {
+		t.Fatal("unavailable must rotate")
+	}
+	if freeBodyRetryable([]byte(`{"error":"Model xxx is not supported"}`)) {
+		t.Fatal("unsupported model must fail fast")
+	}
+	if freeBodyRetryable(nil) {
+		t.Fatal("empty body must not rotate")
+	}
+}
