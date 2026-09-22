@@ -925,7 +925,7 @@ func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.Executor
 func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) ([]byte, http.Header, string, error) {
 	cooldown := e.cfg.cooldown()
 	var lastErr error
-	sessions := e.freeSessions(entry)
+	sessions := e.freeSessions(entry, req)
 	order := e.freepool.order()
 	attempts := 0
 	consecutive := 0
