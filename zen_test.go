@@ -390,3 +390,33 @@ func TestFreeHeadersAuthModes(t *testing.T) {
 		t.Fatal("empty session must omit session headers")
 	}
 }
+
+func TestResponsesMaxOutputTokensClamped(t *testing.T) {
+	raw := []byte(`{"model":"muse-free","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`)
+	out, err := buildResponsesBody(raw, "muse-spark-1.3-contributor-free", []any{})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	var decoded struct {
+		MaxOutputTokens int `json:"max_output_tokens"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.MaxOutputTokens != 16 {
+		t.Fatalf("max_output_tokens = %d, want clamped 16", decoded.MaxOutputTokens)
+	}
+}
+
+func TestFreeRetryableGateRotates(t *testing.T) {
+	for _, status := range []int{401, 403, 429, 500, 503} {
+		if !freeRetryable(status, nil) {
+			t.Fatalf("status %d must rotate", status)
+		}
+	}
+	for _, status := range []int{400, 404, 422} {
+		if freeRetryable(status, nil) {
+			t.Fatalf("status %d must fail fast", status)
+		}
+	}
+}

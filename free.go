@@ -369,6 +369,12 @@ func buildResponsesBody(payload []byte, upstreamModel string, tools []any) ([]by
 	}
 	if chat.MaxTokens > 0 {
 		out["max_output_tokens"] = chat.MaxTokens
+	} else {
+		out["max_output_tokens"] = 1024
+	}
+	// Upstream rejects max_output_tokens < 16; clamp rather than fail.
+	if n, ok := out["max_output_tokens"].(int); ok && n < 16 {
+		out["max_output_tokens"] = 16
 	}
 	return json.Marshal(out)
 }
@@ -839,7 +845,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 			status, headers, respBody, err := e.freeAttempt(ctx, req, entry, s, m, mi)
 			if err != nil {
 				lastErr = err
-				if retryable(0, err) && ctx.Err() == nil {
+				if freeRetryable(0, err) && ctx.Err() == nil {
 					e.coolFree(s, mi, cooldown)
 					continue
 				}
@@ -847,7 +853,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 			}
 			if status < 200 || status >= 300 {
 				lastErr = statusError{statusCode: status, body: respBody}
-				if retryable(status, nil) && ctx.Err() == nil {
+				if freeRetryable(status, nil) && ctx.Err() == nil {
 					e.coolFree(s, mi, cooldown)
 					continue
 				}
@@ -955,7 +961,19 @@ func (e *Executor) paidFallback(ctx context.Context, req pluginapi.ExecutorReque
 	return nil, nil, "", statusError{statusCode: http.StatusBadGateway, msg: "zen paid fallback: all pool members failed"}
 }
 
-// forwardChatSSE passes OpenAI SSE lines through with route framing.
+// freeRetryable reports whether a free-tier failure is worth rotating to
+// the next member/session. Unlike the paid pool, HTTP 403 here is the
+// normal gate/quota signal (FreeTierError), not a malformed request, so it
+// must rotate instead of failing fast.
+func freeRetryable(status int, err error) bool {
+	if err != nil {
+		return true
+	}
+	if status == 400 || status == 404 || status == 422 {
+		return false
+	}
+	return true
+}
 func forwardChatSSE(ctx context.Context, sse []byte, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk, 8)
 	go func() {
