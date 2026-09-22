@@ -440,7 +440,7 @@ func TestResponsesMinOutputFloor(t *testing.T) {
 	}
 }
 
-func TestEmptyStreamEmitsTerminal(t *testing.T) {
+func TestEmptyStreamYieldsNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch := convertResponsesSSE(ctx, []byte("data: {\"type\":\"response.created\"}\n\ndata: [DONE]\n"), framingBare)
@@ -450,8 +450,8 @@ func TestEmptyStreamEmitsTerminal(t *testing.T) {
 			n++
 		}
 	}
-	if n != 1 {
-		t.Fatalf("empty stream must yield exactly one terminal chunk, got %d", n)
+	if n != 0 {
+		t.Fatalf("converters must not mask emptiness (wrapper owns fallback), got %d chunks", n)
 	}
 }
 
@@ -537,12 +537,24 @@ func TestStreamFallbackOnEmpty(t *testing.T) {
 	close(empty)
 	_, p, _ := Build([]byte("free:\n  enabled: true\n"))
 	p.executor.cfg.Free.Quota.FailoverPaid = false
-	out := p.executor.streamWithPaidFallback(ctx, pluginapi.ExecutorRequest{}, empty, framingBare)
-	n := 0
-	for range out {
-		n++
+	out := p.executor.streamWithPaidFallback(ctx, pluginapi.ExecutorRequest{Model: "muse-free"}, empty, framingBare)
+	var chunks [][]byte
+	for c := range out {
+		chunks = append(chunks, c.Payload)
 	}
-	if n != 0 {
-		t.Fatalf("without fallback, empty stream must stay empty, got %d", n)
+	if len(chunks) != 1 {
+		t.Fatalf("without fallback, empty stream must yield one terminal chunk, got %d", len(chunks))
+	}
+	var decoded struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(chunks[0], &decoded); err != nil {
+		t.Fatalf("terminal chunk must be JSON: %v", err)
+	}
+	if decoded.Model != "muse-free" || len(decoded.Choices) != 1 || decoded.Choices[0].FinishReason != "stop" {
+		t.Fatalf("terminal chunk wrong: %+v", decoded)
 	}
 }

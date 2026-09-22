@@ -957,9 +957,23 @@ func (e *Executor) streamWithPaidFallback(ctx context.Context, req pluginapi.Exe
 		}
 		fbBody, _, _, fbErr := e.paidFallback(ctx, req, nil)
 		if fbErr != nil {
+			// Nothing to deliver: emit one terminal chunk with the model
+			// set so downstream completes gracefully instead of erroring
+			// on a bare stream end.
+			terminal, _ := json.Marshal(map[string]any{
+				"model":   req.Model,
+				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+			})
+			if framing == framingClaude {
+				terminal = append([]byte("data: "), terminal...)
+			}
+			select {
+			case <-ctx.Done():
+			case out <- pluginapi.ExecutorStreamChunk{Payload: terminal}:
+			}
 			return
 		}
-		for _, piece := range chunkCompletion(fbBody, framing) {
+		for _, piece := range chunkCompletion(req.Model, fbBody, framing) {
 			select {
 			case <-ctx.Done():
 				return
@@ -971,7 +985,7 @@ func (e *Executor) streamWithPaidFallback(ctx context.Context, req pluginapi.Exe
 }
 
 // chunkCompletion splits a non-stream OpenAI completion into stream deltas.
-func chunkCompletion(fbBody []byte, framing streamFraming) [][]byte {
+func chunkCompletion(model string, fbBody []byte, framing streamFraming) [][]byte {
 	var decoded struct {
 		Model   string `json:"model"`
 		Choices []struct {
@@ -999,6 +1013,7 @@ func chunkCompletion(fbBody []byte, framing streamFraming) [][]byte {
 				end = len(content)
 			}
 			raw, _ := json.Marshal(map[string]any{
+				"model":   model,
 				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": content[i:end]}}},
 			})
 			pieces = append(pieces, enc(raw))
@@ -1006,11 +1021,13 @@ func chunkCompletion(fbBody []byte, framing streamFraming) [][]byte {
 	}
 	if len(decoded.Choices[0].Message.ToolCalls) > 0 {
 		raw, _ := json.Marshal(map[string]any{
+			"model":   model,
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": decoded.Choices[0].Message.ToolCalls}}},
 		})
 		pieces = append(pieces, enc(raw))
 	}
 	raw, _ := json.Marshal(map[string]any{
+		"model":   model,
 		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
 	})
 	pieces = append(pieces, enc(raw))
@@ -1251,14 +1268,14 @@ func forwardChatSSE(ctx context.Context, sse []byte, framing streamFraming) <-ch
 }
 
 // convertResponsesSSE converts Responses SSE to OpenAI deltas incrementally.
-// A terminal empty chunk is emitted when nothing else was, so downstream
-// never sees a bare stream end as a transport error.
+// Empty upstream yields an empty channel; the streamWithPaidFallback wrapper
+// owns the empty policy (do not emit terminal chunks here, they would mask
+// the fallback trigger as delivered data).
 func convertResponsesSSE(ctx context.Context, sse []byte, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk, 8)
 	go func() {
 		defer close(out)
 		c := newResponsesConverter()
-		emitted := 0
 		emit := func(payload []byte) bool {
 			if len(bytes.TrimSpace(payload)) == 0 {
 				return true
@@ -1270,7 +1287,6 @@ func convertResponsesSSE(ctx context.Context, sse []byte, framing streamFraming)
 			case <-ctx.Done():
 				return false
 			case out <- pluginapi.ExecutorStreamChunk{Payload: payload}:
-				emitted++
 				return true
 			}
 		}
@@ -1285,12 +1301,6 @@ func convertResponsesSSE(ctx context.Context, sse []byte, framing streamFraming)
 				return
 			default:
 			}
-		}
-		if emitted == 0 {
-			terminal, _ := json.Marshal(map[string]any{
-				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
-			})
-			emit(terminal)
 		}
 	}()
 	return out
