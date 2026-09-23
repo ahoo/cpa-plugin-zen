@@ -63,10 +63,21 @@ type sessionPool struct {
 	mu       sync.Mutex
 	sessions []sessionEntry
 	rr       int
+	path     string
 }
 
+// burnedSessionCooldown is the penalty for a session the upstream rejects
+// with 403 FreeTierError: it is dead, not flaky, so park it for hours
+// instead of minutes.
+const burnedSessionCooldown = 6 * 3600
+
+// sessionCoverage caps how many pool sessions one request may try. The pool
+// is mostly corpses during upstream crunches; 3 was too few to reach a
+// live one.
+const sessionCoverage = 6
+
 func loadSessionPool(path string) *sessionPool {
-	p := &sessionPool{}
+	p := &sessionPool{path: strings.TrimSpace(path)}
 	if strings.TrimSpace(path) == "" {
 		return p
 	}
@@ -128,8 +139,29 @@ func (p *sessionPool) report(id string, ok bool, cooldownSec int) {
 				p.sessions[i].CooldownUntil = time.Now().Unix() + int64(cooldownSec)
 			}
 		}
+		p.saveLocked()
 		return
 	}
+}
+
+// saveLocked persists health counters so restarts don't resurrect burned
+// sessions. Caller must hold p.mu. Best-effort: a failed write only means
+// the next restart retries a corpse, which rotation already handles.
+func (p *sessionPool) saveLocked() {
+	if strings.TrimSpace(p.path) == "" {
+		return
+	}
+	raw, err := json.Marshal(struct {
+		Sessions []sessionEntry `json:"sessions"`
+	}{Sessions: p.sessions})
+	if err != nil {
+		return
+	}
+	tmp := p.path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, p.path)
 }
 
 // poolSessionHeader carries the sticky pool assignment from the
@@ -1125,7 +1157,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 	for _, mi := range order {
 		m := e.freepool.members[mi]
 		for _, s := range sessions {
-			if attempts >= 8 {
+			if attempts >= 12 {
 				break
 			}
 			// Three straight failures means the free tier is down, not
@@ -1147,6 +1179,15 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 			if status < 200 || status >= 300 {
 				lastErr = statusError{statusCode: status, body: respBody}
 				if (freeRetryable(status, nil) || freeBodyRetryable(respBody)) && ctx.Err() == nil {
+					if status == http.StatusForbidden {
+						// 403 FreeTierError means this session is burned:
+						// park it for hours and keep rotating. It must NOT
+						// count toward the consecutive breaker, which is
+						// for transport-level outages.
+						e.sessions.report(s, false, burnedSessionCooldown)
+						e.freepool.cool(mi, cooldown)
+						continue
+					}
 					e.coolFree(s, mi, cooldown)
 					consecutive++
 					continue
@@ -1157,7 +1198,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 			stampPoolSession(headers, s)
 			return respBody, headers, strings.ToLower(strings.TrimSpace(entry.Endpoint)), nil
 		}
-		if attempts >= 8 {
+		if attempts >= 12 {
 			break
 		}
 	}
@@ -1184,7 +1225,7 @@ func (e *Executor) freeSessions(entry FreeModelEntry, req pluginapi.ExecutorRequ
 	}
 	out := []string{}
 	seen := map[string]struct{}{}
-	for len(out) < 3 {
+	for len(out) < sessionCoverage {
 		s := e.sessions.pick()
 		if s == "" {
 			break

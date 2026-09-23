@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -598,5 +599,36 @@ func TestResponsesConverterTextDone(t *testing.T) {
 	out := c.convertLine(line)
 	if len(out) == 0 || !bytes.Contains(out, []byte("PONG")) {
 		t.Fatalf("done event dropped: %q", out)
+	}
+}
+
+func TestBurnedSessionPersists(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/pool.json"
+	p := &sessionPool{path: path, sessions: []sessionEntry{{ID: "ses_x", Fails: 4}}}
+	p.report("ses_x", false, burnedSessionCooldown)
+	if p.sessions[0].Fails != 5 {
+		t.Fatalf("fails not incremented: %+v", p.sessions[0])
+	}
+	if p.sessions[0].CooldownUntil <= time.Now().Unix()+5*3600 {
+		t.Fatal("burned session must cool for hours")
+	}
+	reloaded := loadSessionPool(path)
+	if len(reloaded.sessions) != 1 || reloaded.sessions[0].Fails != 5 {
+		t.Fatalf("health not persisted: %+v", reloaded.sessions)
+	}
+	if got := reloaded.pick(); got != "" {
+		t.Fatalf("retired session must not be picked, got %q", got)
+	}
+}
+
+func TestSessionCoverageReachesDeep(t *testing.T) {
+	e := &Executor{cfg: testConfig(), sessions: &sessionPool{}}
+	for i := 0; i < 8; i++ {
+		e.sessions.sessions = append(e.sessions.sessions, sessionEntry{ID: "ses_" + string(rune('a'+i))})
+	}
+	got := e.freeSessions(FreeModelEntry{Alias: "mimo-free", Endpoint: "chat"}, pluginapi.ExecutorRequest{Headers: http.Header{}})
+	if len(got) != sessionCoverage {
+		t.Fatalf("coverage = %d, want %d", len(got), sessionCoverage)
 	}
 }
