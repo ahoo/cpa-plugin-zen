@@ -448,12 +448,13 @@ func TestEmptyStreamYieldsNothing(t *testing.T) {
 	ch := convertResponsesSSE(ctx, []byte("data: {\"type\":\"response.created\"}\n\ndata: [DONE]\n"), framingBare)
 	n := 0
 	for chunk := range ch {
-		if len(bytes.TrimSpace(chunk.Payload)) > 0 {
-			n++
+		if len(bytes.TrimSpace(chunk.Payload)) != 0 || chunk.Err == nil {
+			t.Fatalf("incomplete upstream must report an error without success chunks: %+v", chunk)
 		}
+		n++
 	}
-	if n != 0 {
-		t.Fatalf("converters must not mask emptiness (wrapper owns fallback), got %d chunks", n)
+	if n != 1 {
+		t.Fatalf("incomplete upstream must produce one error, got %d chunks", n)
 	}
 }
 
@@ -529,35 +530,6 @@ func TestFreeBodyRetryable(t *testing.T) {
 	}
 	if freeBodyRetryable(nil) {
 		t.Fatal("empty body must not rotate")
-	}
-}
-
-func TestStreamFallbackOnEmpty(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	empty := make(chan pluginapi.ExecutorStreamChunk)
-	close(empty)
-	_, p, _ := Build([]byte("free:\n  enabled: true\n"))
-	p.executor.cfg.Free.Quota.FailoverPaid = false
-	out := p.executor.streamWithPaidFallback(ctx, pluginapi.ExecutorRequest{Model: "muse-free"}, empty, framingBare)
-	var chunks [][]byte
-	for c := range out {
-		chunks = append(chunks, c.Payload)
-	}
-	if len(chunks) != 1 {
-		t.Fatalf("without fallback, empty stream must yield one terminal chunk, got %d", len(chunks))
-	}
-	var decoded struct {
-		Model   string `json:"model"`
-		Choices []struct {
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(chunks[0], &decoded); err != nil {
-		t.Fatalf("terminal chunk must be JSON: %v", err)
-	}
-	if decoded.Model != "muse-free" || len(decoded.Choices) != 1 || decoded.Choices[0].FinishReason != "stop" {
-		t.Fatalf("terminal chunk wrong: %+v", decoded)
 	}
 }
 

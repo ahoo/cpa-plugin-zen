@@ -81,7 +81,7 @@ func (e *Executor) call(ctx context.Context, req pluginapi.ExecutorRequest) (plu
 			lastErr = err
 			continue
 		}
-		status, headers, respBody, err := d.do(ctx, e.endpoint(), upstreamHeaders(strings.TrimSpace(m.Key)), sysBody)
+		status, headers, respBody, err := d.do(ctx, http.MethodPost, e.endpoint(), upstreamHeaders(strings.TrimSpace(m.Key)), sysBody)
 		if err != nil {
 			lastErr = err
 			if retryable(0, err) && ctx.Err() == nil {
@@ -117,8 +117,8 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	return e.call(ctx, req)
 }
 
-// ExecuteStream performs the same single-shot call and emits the answers as
-// one stream chunk. Normalized chunks stay bare for OpenAI routes;
+// ExecuteStream performs the same single-shot call and emits content before
+// terminal usage. Normalized chunks stay bare for OpenAI routes;
 // /v1/messages receives one data: prefix because the host's OpenAI-to-Claude
 // translator consumes SSE-framed input. The host emits its own stream tail.
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
@@ -141,7 +141,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 			lastErr = err
 			continue
 		}
-		status, headers, respBody, err := d.do(ctx, e.endpoint(), upstreamHeaders(strings.TrimSpace(m.Key)), sysBody)
+		status, headers, respBody, err := d.do(ctx, http.MethodPost, e.endpoint(), upstreamHeaders(strings.TrimSpace(m.Key)), sysBody)
 		if err != nil {
 			lastErr = err
 			if retryable(0, err) && ctx.Err() == nil {
@@ -156,17 +156,15 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 			}
 			return pluginapi.ExecutorStreamResponse{}, lastErr
 		}
-		chunk, err := mapToStreamChunk(req.Model, respBody)
+		completion, err := mapToCompletion(req.Model, respBody)
 		if err != nil {
 			return pluginapi.ExecutorStreamResponse{}, statusError{statusCode: http.StatusBadGateway, msg: err.Error()}
 		}
-		if framingForRequest(req) == framingClaude {
-			chunk = append([]byte("data: "), chunk...)
+		pieces := chunkCompletion(req.Model, completion, framingForRequest(req))
+		if len(pieces) == 0 {
+			return pluginapi.ExecutorStreamResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "zen executor: invalid SystemOne completion"}
 		}
-		ch := make(chan pluginapi.ExecutorStreamChunk, 1)
-		ch <- pluginapi.ExecutorStreamChunk{Payload: chunk}
-		close(ch)
-		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: ch}, nil
+		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: completionChunks(ctx, pieces)}, nil
 	}
 	if lastErr != nil {
 		return pluginapi.ExecutorStreamResponse{}, lastErr
@@ -244,7 +242,7 @@ func (e *Executor) HttpRequest(ctx context.Context, req pluginapi.ExecutorHTTPRe
 		}
 		d = hostDoer{client: req.HTTPClient}
 	}
-	status, respHeaders, respBody, err := d.do(ctx, strings.TrimSpace(req.URL), headers, req.Body)
+	status, respHeaders, respBody, err := d.do(ctx, req.Method, strings.TrimSpace(req.URL), headers, req.Body)
 	if err != nil {
 		return pluginapi.ExecutorHTTPResponse{}, err
 	}

@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"fmt"
+	"math"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -258,10 +260,59 @@ func parseConfigStrict(raw []byte) (*pluginConfig, error) {
 		return cfg, nil
 	}
 	if err := yaml.Unmarshal(raw, cfg); err != nil {
+		// YAML decoding errors can include the original scalar (including keys
+		// or credential-bearing proxy URLs); never return those values to the host.
+		return nil, fmt.Errorf("zen config: invalid YAML or field type")
+	}
+	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	cfg.buildIndexes()
 	return cfg, nil
+}
+
+// validate normalizes endpoint names and checks the same pool members that
+// request execution uses. Preserve the existing <=0 -> 1 weight default.
+// Report only field paths, never configured keys, model values or proxy URLs.
+func (c *pluginConfig) validate() error {
+	for i := range c.Free.Models {
+		endpoint := strings.ToLower(strings.TrimSpace(c.Free.Models[i].Endpoint))
+		if endpoint == "" {
+			endpoint = "chat"
+		}
+		switch endpoint {
+		case "chat", "responses", "systemone":
+			c.Free.Models[i].Endpoint = endpoint
+		default:
+			return fmt.Errorf("zen config: free.models[%d].endpoint must be chat, responses, or systemone", i)
+		}
+	}
+
+	paidTotal := 0
+	for i, member := range c.Paid.APIKeys {
+		if strings.TrimSpace(member.Key) == "" {
+			continue // members() ignores empty keys and can use the legacy fallback
+		}
+		weight := member.normWeight()
+		if weight > math.MaxInt-paidTotal {
+			return fmt.Errorf("zen config: paid.api_keys[%d].weight total exceeds int limit", i)
+		}
+		paidTotal += weight
+	}
+	if c.Free.Enabled {
+		freeTotal := 0
+		for i, member := range c.Free.Members {
+			if member.Disabled {
+				continue
+			}
+			weight := member.normWeight()
+			if weight > math.MaxInt-freeTotal {
+				return fmt.Errorf("zen config: free.members[%d].weight total exceeds int limit", i)
+			}
+			freeTotal += weight
+		}
+	}
+	return nil
 }
 
 // effectiveModels returns the configured entries, or the built-in defaults

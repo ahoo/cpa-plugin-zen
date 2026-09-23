@@ -1,9 +1,11 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -123,13 +125,13 @@ func (p *pool) clientFor(idx int, member APIKeyEntry, hostClient pluginapi.HostH
 // doer abstracts host vs self-built HTTP execution. SystemOne upstream is a
 // single-shot JSON endpoint, so only non-streaming calls are needed.
 type doer interface {
-	do(ctx context.Context, url string, headers http.Header, body []byte) (status int, respHeaders http.Header, respBody []byte, err error)
+	do(ctx context.Context, method, url string, headers http.Header, body []byte) (status int, respHeaders http.Header, respBody []byte, err error)
 }
 
 type hostDoer struct{ client pluginapi.HostHTTPClient }
 
-func (d hostDoer) do(ctx context.Context, url string, headers http.Header, body []byte) (int, http.Header, []byte, error) {
-	resp, err := d.client.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodPost, URL: url, Headers: headers, Body: body})
+func (d hostDoer) do(ctx context.Context, method, url string, headers http.Header, body []byte) (int, http.Header, []byte, error) {
+	resp, err := d.client.Do(ctx, pluginapi.HTTPRequest{Method: method, URL: url, Headers: headers, Body: body})
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -138,8 +140,9 @@ func (d hostDoer) do(ctx context.Context, url string, headers http.Header, body 
 
 type stdDoer struct{ client *http.Client }
 
-func (d stdDoer) do(ctx context.Context, url string, headers http.Header, body []byte) (int, http.Header, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(body)))
+func (d stdDoer) do(ctx context.Context, method, url string, headers http.Header, body []byte) (int, http.Header, []byte, error) {
+	// NewRequestWithContext defaults an empty method to GET, as does the host.
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -149,16 +152,9 @@ func (d stdDoer) do(ctx context.Context, url string, headers http.Header, body [
 		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	respBody := make([]byte, 0, 4096)
-	buf := make([]byte, 32*1024)
-	for {
-		n, errRead := resp.Body.Read(buf)
-		if n > 0 {
-			respBody = append(respBody, buf[:n]...)
-		}
-		if errRead != nil {
-			break
-		}
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("zen executor: read HTTP response: %w", err)
 	}
 	return resp.StatusCode, resp.Header, respBody, nil
 }
@@ -168,7 +164,7 @@ func (d stdDoer) do(ctx context.Context, url string, headers http.Header, body [
 func proxyTransport(proxyURL string) (http.RoundTripper, error) {
 	u, err := url.Parse(proxyURL)
 	if err != nil {
-		return nil, fmt.Errorf("zen executor: invalid proxy_url %q: %w", proxyURL, err)
+		return nil, fmt.Errorf("zen executor: invalid proxy_url")
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":
@@ -178,20 +174,29 @@ func proxyTransport(proxyURL string) (http.RoundTripper, error) {
 			DialContext:     (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		}, nil
 	case "socks5", "socks5h":
-		dialer, err := proxy.FromURL(u, proxy.Direct)
+		// A ContextDialer is required here: Dial ignores request cancellation,
+		// and proxy.Direct provides no dial timeout for a stalled proxy.
+		dialer, err := proxy.FromURL(u, &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second})
 		if err != nil {
-			return nil, fmt.Errorf("zen executor: invalid socks proxy %q: %w", proxyURL, err)
+			return nil, fmt.Errorf("zen executor: invalid socks proxy_url")
+		}
+		contextDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("zen executor: socks proxy_url does not support context dialing")
 		}
 		return &http.Transport{
+			Proxy: nil,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.Dial(network, addr)
+				dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				return contextDialer.DialContext(dialCtx, network, addr)
 			},
 			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 		}, nil
 	case "":
-		return nil, fmt.Errorf("zen executor: proxy_url %q missing scheme", proxyURL)
+		return nil, fmt.Errorf("zen executor: proxy_url missing scheme")
 	default:
-		return nil, fmt.Errorf("zen executor: unsupported proxy scheme %q", u.Scheme)
+		return nil, fmt.Errorf("zen executor: unsupported proxy scheme")
 	}
 }
 

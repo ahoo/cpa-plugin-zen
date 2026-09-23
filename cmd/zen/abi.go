@@ -54,7 +54,9 @@ import "C"
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"sync"
 	"unsafe"
@@ -71,9 +73,16 @@ var pluginVersion = "0.2.0"
 
 var abiState = struct {
 	sync.RWMutex
-	host   *C.cliproxy_host_api
-	plugin *plug.ZenPlugin
+	host      *C.cliproxy_host_api
+	plugin    *plug.ZenPlugin
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closing   bool
+	callbacks int
+	workers   int
 }{}
+
+var abiDrained = sync.NewCond(&abiState.RWMutex)
 
 type abiLifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
@@ -157,11 +166,17 @@ type abiEmptyResponse struct{}
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
-	if host == nil || plugin == nil {
+	if host == nil || plugin == nil || uint32(host.abi_version) != pluginabi.ABIVersion || host.call == nil || host.free_buffer == nil {
 		return 1
 	}
 	abiState.Lock()
+	if abiState.host != nil {
+		abiState.Unlock()
+		return 1
+	}
 	abiState.host = host
+	abiState.ctx, abiState.cancel = context.WithCancel(context.Background())
+	abiState.closing = false
 	abiState.Unlock()
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.ZenPluginCall)
@@ -195,24 +210,42 @@ func ZenPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, resp
 		return 1
 	}
 	methodName := C.GoString(method)
+	limit := uint64(math.MaxInt32)
+	if methodName == pluginabi.MethodRequestInterceptBefore || methodName == pluginabi.MethodRequestInterceptAfter {
+		limit = maxInterceptPayloadBytes
+	}
+	if err := validateABIBuffer(request != nil, uint64(requestLen), limit); err != nil {
+		writeABIResponse(response, abiErrorEnvelope("invalid_request", err.Error()))
+		return 1
+	}
 	var requestBytes []byte
-	if request != nil && requestLen > 0 {
-		// Gate interceptor envelopes before copying: they carry the whole
-		// (base64) request body and must stay far below the C.int conversion.
-		if (methodName == pluginabi.MethodRequestInterceptBefore || methodName == pluginabi.MethodRequestInterceptAfter) &&
-			uint64(requestLen) > maxInterceptPayloadBytes {
-			writeABIResponse(response, abiErrorEnvelope("invalid_request", "request payload exceeds size limit"))
-			return 1
-		}
+	if requestLen > 0 {
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, errHandle := handleABIMethod(context.Background(), methodName, requestBytes)
+	abiState.RLock()
+	ctx := abiState.ctx
+	abiState.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	raw, errHandle := handleABIMethod(ctx, methodName, requestBytes)
 	if errHandle != nil {
 		writeABIResponse(response, abiErrorEnvelopeFromError("plugin_error", errHandle))
 		return 1
 	}
 	writeABIResponse(response, raw)
 	return 0
+}
+
+// validateABIBuffer runs before C.GoBytes can narrow size_t to a signed C.int.
+func validateABIBuffer(hasPointer bool, length, limit uint64) error {
+	if length > limit || length > math.MaxInt32 {
+		return fmt.Errorf("buffer exceeds size limit")
+	}
+	if length > 0 && !hasPointer {
+		return fmt.Errorf("non-empty buffer requires a pointer")
+	}
+	return nil
 }
 
 //export ZenPluginFree
@@ -225,9 +258,51 @@ func ZenPluginFree(ptr unsafe.Pointer, len C.size_t) {
 //export ZenPluginShutdown
 func ZenPluginShutdown() {
 	abiState.Lock()
+	abiState.closing = true
 	abiState.plugin = nil
-	abiState.host = nil
+	cancel := abiState.cancel
 	abiState.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	abiState.Lock()
+	// The host frees its C callback table after shutdown returns. Allow
+	// closing callbacks while workers drain; never hold this mutex over C.
+	for abiState.workers > 0 || abiState.callbacks > 0 {
+		abiDrained.Wait()
+	}
+	abiState.host = nil
+	abiState.ctx = nil
+	abiState.cancel = nil
+	abiState.Unlock()
+}
+
+func beginABIWorker() bool {
+	abiState.Lock()
+	defer abiState.Unlock()
+	if abiState.closing {
+		return false
+	}
+	abiState.workers++
+	return true
+}
+
+func endABIWorker() {
+	abiState.Lock()
+	abiState.workers--
+	abiDrained.Broadcast()
+	abiState.Unlock()
+}
+
+func startABIWorker(work func()) bool {
+	if !beginABIWorker() {
+		return false
+	}
+	go func() {
+		defer endABIWorker()
+		work()
+	}()
+	return true
 }
 
 func handleABIMethod(ctx context.Context, method string, request []byte) ([]byte, error) {
@@ -296,11 +371,13 @@ func handleABIMethod(ctx context.Context, method string, request []byte) ([]byte
 		}
 		req := rpcReq.ExecutorRequest
 		req.HTTPClient = abiHostHTTPClient{callbackID: rpcReq.HostCallbackID}
-		resp, errCall := p.ExecuteStream(ctx, req)
+		streamCtx, cancel := context.WithCancel(ctx)
+		resp, errCall := p.ExecuteStream(streamCtx, req)
 		if errCall != nil {
+			cancel()
 			return nil, errCall
 		}
-		streamResp, errMarshal := marshalABIStreamResponse(ctx, rpcReq.StreamID, resp)
+		streamResp, errMarshal := marshalABIStreamResponse(streamCtx, cancel, rpcReq.StreamID, resp)
 		if errMarshal != nil {
 			return nil, errMarshal
 		}
@@ -360,6 +437,10 @@ func handleRegister(request []byte) ([]byte, error) {
 	}
 	built.Metadata.Version = pluginVersion
 	abiState.Lock()
+	if abiState.closing {
+		abiState.Unlock()
+		return nil, fmt.Errorf("zen plugin is shutting down")
+	}
 	abiState.plugin = p
 	abiState.Unlock()
 	return abiOKEnvelope(abiRegistration{
@@ -402,6 +483,17 @@ func (c abiHostHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (p
 }
 
 func (c abiHostHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	// Reserve cleanup ownership before obtaining a Host stream ID. Shutdown
+	// must not clear the callback table in the gap before the reader starts.
+	if !beginABIWorker() {
+		return pluginapi.HTTPStreamResponse{}, fmt.Errorf("zen plugin is shutting down")
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			endABIWorker()
+		}
+	}()
 	resp, errCall := callHost[abiHostHTTPStreamResponse](pluginabi.MethodHostHTTPDoStream, abiHostHTTPRequest{
 		HTTPRequest:    req,
 		HostCallbackID: c.callbackID,
@@ -411,7 +503,11 @@ func (c abiHostHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPReque
 	}
 	if resp.StreamID != "" {
 		chunks := make(chan pluginapi.HTTPStreamChunk)
-		go readHostHTTPStream(ctx, resp.StreamID, chunks)
+		transferred = true
+		go func() {
+			defer endABIWorker()
+			readHostHTTPStream(ctx, resp.StreamID, chunks)
+		}()
 		return pluginapi.HTTPStreamResponse{StatusCode: resp.StatusCode, Headers: resp.Headers, Chunks: chunks}, nil
 	}
 	chunks := make(chan pluginapi.HTTPStreamChunk, len(resp.Chunks))
@@ -424,25 +520,35 @@ func (c abiHostHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPReque
 
 func readHostHTTPStream(ctx context.Context, streamID string, out chan<- pluginapi.HTTPStreamChunk) {
 	defer close(out)
-	for {
+	var once sync.Once
+	closeStream := func() { once.Do(func() { closeHostHTTPStream(streamID) }) }
+	// Close the upstream bridge even when cancellation happens during a
+	// blocking host read, rather than waiting for its next payload.
+	stop := context.AfterFunc(ctx, closeStream)
+	defer func() {
+		stop()
+		closeStream()
+	}()
+	send := func(chunk pluginapi.HTTPStreamChunk) bool {
 		select {
 		case <-ctx.Done():
-			closeHostHTTPStream(streamID)
-			return
-		default:
+			return false
+		case out <- chunk:
+			return true
 		}
+	}
+	for ctx.Err() == nil {
 		resp, errRead := callHost[abiHostHTTPStreamReadResponse](pluginabi.MethodHostHTTPStreamRead, abiHostHTTPStreamReadRequest{StreamID: streamID})
 		if errRead != nil {
-			closeHostHTTPStream(streamID)
-			out <- pluginapi.HTTPStreamChunk{Err: errRead}
+			send(pluginapi.HTTPStreamChunk{Err: errRead})
 			return
 		}
 		if resp.Error != "" {
-			out <- pluginapi.HTTPStreamChunk{Err: fmt.Errorf("%s", resp.Error)}
+			send(pluginapi.HTTPStreamChunk{Err: errors.New(resp.Error)})
 			return
 		}
-		if len(resp.Payload) > 0 {
-			out <- pluginapi.HTTPStreamChunk{Payload: append([]byte(nil), resp.Payload...)}
+		if len(resp.Payload) > 0 && !send(pluginapi.HTTPStreamChunk{Payload: resp.Payload}) {
+			return
 		}
 		if resp.Done {
 			return
@@ -454,22 +560,51 @@ func closeHostHTTPStream(streamID string) {
 	_, _ = callHost[abiEmptyResponse](pluginabi.MethodHostHTTPStreamClose, abiHostHTTPStreamCloseRequest{StreamID: streamID})
 }
 
-func marshalABIStreamResponse(ctx context.Context, streamID string, resp pluginapi.ExecutorStreamResponse) (abiExecutorStreamResponse, error) {
-	if streamID == "" {
-		chunks := make([]pluginapi.ExecutorStreamChunk, 0)
-		for chunk := range resp.Chunks {
-			chunks = append(chunks, chunk)
-		}
-		return abiExecutorStreamResponse{Headers: resp.Headers, Chunks: chunks}, nil
+func marshalABIStreamResponse(ctx context.Context, cancel context.CancelFunc, streamID string, resp pluginapi.ExecutorStreamResponse) (abiExecutorStreamResponse, error) {
+	if resp.Chunks == nil {
+		cancel()
+		return abiExecutorStreamResponse{}, fmt.Errorf("executor returned no stream")
 	}
-	go pumpABIStream(ctx, streamID, resp.Chunks)
+	if streamID == "" {
+		defer cancel()
+		chunks := make([]pluginapi.ExecutorStreamChunk, 0)
+		for {
+			select {
+			case <-ctx.Done():
+				return abiExecutorStreamResponse{}, ctx.Err()
+			case chunk, ok := <-resp.Chunks:
+				if !ok {
+					return abiExecutorStreamResponse{Headers: resp.Headers, Chunks: chunks}, nil
+				}
+				if chunk.Err != nil {
+					return abiExecutorStreamResponse{}, chunk.Err
+				}
+				chunks = append(chunks, chunk)
+			}
+		}
+	}
+	if !startABIWorker(func() {
+		defer cancel()
+		pumpABIStream(ctx, streamID, resp.Chunks)
+	}) {
+		cancel()
+		return abiExecutorStreamResponse{}, fmt.Errorf("zen plugin is shutting down")
+	}
 	return abiExecutorStreamResponse{Headers: resp.Headers}, nil
 }
 
 func pumpABIStream(ctx context.Context, streamID string, chunks <-chan pluginapi.ExecutorStreamChunk) {
 	errorMessage := ""
+	var once sync.Once
+	closeStream := func(message string) {
+		once.Do(func() {
+			_, _ = callHost[abiEmptyResponse](pluginabi.MethodHostStreamClose, abiHostStreamCloseRequest{StreamID: streamID, Error: message})
+		})
+	}
+	stop := context.AfterFunc(ctx, func() { closeStream(ctx.Err().Error()) })
 	defer func() {
-		_, _ = callHost[abiEmptyResponse](pluginabi.MethodHostStreamClose, abiHostStreamCloseRequest{StreamID: streamID, Error: errorMessage})
+		stop()
+		closeStream(errorMessage)
 	}()
 	for {
 		select {
@@ -503,12 +638,21 @@ func pumpABIStream(ctx context.Context, streamID string, chunks <-chan pluginapi
 
 func callHost[T any](method string, request any) (T, error) {
 	var zero T
-	abiState.RLock()
+	abiState.Lock()
 	host := abiState.host
-	abiState.RUnlock()
-	if host == nil || host.call == nil {
+	closingCall := method == pluginabi.MethodHostHTTPStreamClose || method == pluginabi.MethodHostStreamClose
+	if host == nil || host.call == nil || (abiState.closing && !closingCall) {
+		abiState.Unlock()
 		return zero, fmt.Errorf("host callback is unavailable")
 	}
+	abiState.callbacks++
+	abiState.Unlock()
+	defer func() {
+		abiState.Lock()
+		abiState.callbacks--
+		abiDrained.Broadcast()
+		abiState.Unlock()
+	}()
 	rawRequest, errMarshal := json.Marshal(request)
 	if errMarshal != nil {
 		return zero, errMarshal
@@ -526,6 +670,9 @@ func callHost[T any](method string, request any) (T, error) {
 	}
 	if code != 0 {
 		return zero, fmt.Errorf("host callback %s failed with code %d", method, int(code))
+	}
+	if err := validateABIBuffer(resp.ptr != nil, uint64(resp.len), math.MaxInt32); err != nil {
+		return zero, fmt.Errorf("host callback %s: %w", method, err)
 	}
 	rawResp := C.GoBytes(resp.ptr, C.int(resp.len))
 	var envelope pluginabi.Envelope
@@ -568,7 +715,8 @@ func abiErrorEnvelopeFromError(code string, err error) []byte {
 		return abiErrorEnvelope(code, "")
 	}
 	httpStatus := 0
-	if statusProvider, ok := err.(interface{ StatusCode() int }); ok && statusProvider != nil {
+	var statusProvider interface{ StatusCode() int }
+	if errors.As(err, &statusProvider) {
 		httpStatus = statusProvider.StatusCode()
 	}
 	return abiErrorEnvelopeWithStatus(code, err.Error(), httpStatus)

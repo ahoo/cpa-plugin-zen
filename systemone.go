@@ -243,32 +243,3 @@ func mapToCompletion(requestedModel string, respBody []byte) ([]byte, error) {
 		},
 	})
 }
-
-// mapToStreamChunk renders the same answers as a single OpenAI SSE chunk.
-func mapToStreamChunk(requestedModel string, respBody []byte) ([]byte, error) {
-	var ur upstreamResponse
-	if err := json.Unmarshal(respBody, &ur); err != nil {
-		return nil, fmt.Errorf("systemone: invalid upstream response: %w", err)
-	}
-	if len(bytes.TrimSpace(ur.Answers)) == 0 {
-		return nil, fmt.Errorf("systemone: upstream response missing answers")
-	}
-	var compact bytes.Buffer
-	if err := json.Compact(&compact, ur.Answers); err != nil {
-		return nil, fmt.Errorf("systemone: upstream answers are not JSON: %w", err)
-	}
-	return json.Marshal(map[string]any{
-		"id":      completionID(),
-		"object":  "chat.completion.chunk",
-		"created": time.Now().Unix(),
-		"model":   requestedModel,
-		"choices": []any{map[string]any{
-			"index": 0,
-			"delta": map[string]any{
-				"role":    "assistant",
-				"content": compact.String(),
-			},
-			"finish_reason": "stop",
-		}},
-	})
-}

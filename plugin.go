@@ -170,8 +170,8 @@ func (p *ZenPlugin) Execute(ctx context.Context, req pluginapi.ExecutorRequest) 
 	return p.executor.Execute(ctx, req)
 }
 
-// ExecuteStream performs the single-shot upstream call and emits it as one
-// stream chunk (SystemOne has no streaming protocol of its own).
+// ExecuteStream adapts the buffered upstream response to chat stream chunks.
+// SystemOne has no streaming protocol of its own.
 func (p *ZenPlugin) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
 	return p.executor.ExecuteStream(ctx, req)
 }
