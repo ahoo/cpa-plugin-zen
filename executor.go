@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -24,6 +25,9 @@ type Executor struct {
 	keypool  *pool
 	sessions *sessionPool
 	freepool *freePool
+
+	// Temporary 0.2.5 observer: at most one Mimo post-DONE structural summary.
+	mimoTailObserved atomic.Bool
 }
 
 func NewExecutor(cfg *pluginConfig) *Executor {

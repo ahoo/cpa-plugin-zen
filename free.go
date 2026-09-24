@@ -62,16 +62,25 @@ type sessionEntry struct {
 	CooldownUntil int64  `json:"cooldown_until"`
 }
 
+type sessionPoolLoadState uint8
+
+const (
+	sessionPoolMissing sessionPoolLoadState = iota
+	sessionPoolLoaded
+	sessionPoolUnreadable
+	sessionPoolInvalid
+)
+
 type sessionPool struct {
-	mu       sync.Mutex
-	sessions []sessionEntry
-	rr       int
-	path     string
+	mu        sync.Mutex
+	sessions  []sessionEntry
+	rr        int
+	path      string
+	loadState sessionPoolLoadState
 }
 
-// burnedSessionCooldown is the penalty for a session the upstream rejects
-// with 403 FreeTierError: it is dead, not flaky, so park it for hours
-// instead of minutes.
+// burnedSessionCooldown preserves the existing penalty for unclassified
+// session rejections. Explicit client-policy denials do not change health.
 const burnedSessionCooldown = 6 * 3600
 
 // sessionCoverage caps how many pool sessions one request may try. The pool
@@ -86,12 +95,17 @@ func loadSessionPool(path string) *sessionPool {
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			p.loadState = sessionPoolUnreadable
+		}
 		return p
 	}
+	p.loadState = sessionPoolLoaded
 	var doc struct {
 		Sessions []sessionEntry `json:"sessions"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
+		p.loadState = sessionPoolInvalid
 		return p
 	}
 	for _, s := range doc.Sessions {
@@ -549,6 +563,8 @@ func flattenResponsesTools(tools []any) []any {
 	return out
 }
 
+const sseTerminationMessage = "zen free executor: data after SSE termination"
+
 // sseEvents joins all data fields belonging to one SSE event. Line-by-line
 // JSON parsing breaks valid multiline events and can discard upstream errors.
 func sseEvents(body []byte) ([][]byte, bool, error) {
@@ -560,12 +576,12 @@ func sseEvents(body []byte) ([][]byte, bool, error) {
 			return nil
 		}
 		payload := bytes.TrimSpace(bytes.Join(fields, []byte("\n")))
-		fields = nil
+		fields = fields[:0]
 		for bytes.HasPrefix(payload, []byte("data:")) {
 			payload = bytes.TrimSpace(payload[len("data:"):])
 		}
 		if done {
-			return statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: data after SSE termination"}
+			return statusError{statusCode: http.StatusBadGateway, msg: sseTerminationMessage}
 		}
 		if string(payload) == "[DONE]" {
 			done = true
@@ -577,7 +593,7 @@ func sseEvents(body []byte) ([][]byte, bool, error) {
 		events = append(events, payload)
 		return nil
 	}
-	for _, line := range bytes.Split(body, []byte("\n")) {
+	for line := range bytes.SplitSeq(body, []byte("\n")) {
 		line = bytes.TrimSuffix(line, []byte("\r"))
 		if len(line) == 0 {
 			if err := flush(); err != nil {
@@ -620,9 +636,36 @@ func upstreamSSEError(payload []byte) error {
 	return nil
 }
 
-// assembleChatCompletion folds OpenAI SSE events into one completion.
 type collectedTool struct {
-	id, name, arguments string
+	id, name  string
+	arguments strings.Builder
+}
+
+// parsedSSE keeps the validated result and, for streaming callers, its original
+// or converted events. No successful event is emitted before parsing completes.
+type parsedSSE struct {
+	content string
+	tools   map[int]*collectedTool
+	finish  string
+	usage   map[string]any
+	chunks  [][]byte
+}
+
+func (p *parsedSSE) empty() bool {
+	return strings.TrimSpace(p.content) == "" && len(p.tools) == 0
+}
+
+func (p *parsedSSE) marshal(model string) ([]byte, error) {
+	message := map[string]any{"role": "assistant", "content": p.content}
+	if len(p.tools) != 0 {
+		message["tool_calls"] = collectedCalls(p.tools)
+	}
+	return json.Marshal(map[string]any{
+		"id": completionID(), "object": "chat.completion", "created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": p.finish}},
+		"usage":   p.usage,
+	})
 }
 
 func collectedCalls(tools map[int]*collectedTool) []any {
@@ -636,13 +679,22 @@ func collectedCalls(tools map[int]*collectedTool) []any {
 		tool := tools[idx]
 		calls = append(calls, map[string]any{
 			"id": tool.id, "type": "function",
-			"function": map[string]any{"name": tool.name, "arguments": tool.arguments},
+			"function": map[string]any{"name": tool.name, "arguments": tool.arguments.String()},
 		})
 	}
 	return calls
 }
 
+// assembleChatCompletion folds OpenAI SSE events into one completion.
 func assembleChatCompletion(requestedModel string, sse []byte) ([]byte, error) {
+	parsed, err := parseChatSSE(sse)
+	if err != nil {
+		return nil, err
+	}
+	return parsed.marshal(requestedModel)
+}
+
+func parseChatSSE(sse []byte) (*parsedSSE, error) {
 	events, done, err := sseEvents(sse)
 	if err != nil {
 		return nil, err
@@ -697,7 +749,7 @@ func assembleChatCompletion(requestedModel string, sse []byte) ([]byte, error) {
 				if call.Function.Name != "" {
 					tool.name = call.Function.Name
 				}
-				tool.arguments += call.Function.Arguments
+				tool.arguments.WriteString(call.Function.Arguments)
 			}
 			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				finish = *choice.FinishReason
@@ -712,32 +764,20 @@ func assembleChatCompletion(requestedModel string, sse []byte) ([]byte, error) {
 	if !done || finish == "" {
 		return nil, statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: incomplete chat stream"}
 	}
-	message := map[string]any{"role": "assistant", "content": content.String()}
-	if len(tools) != 0 {
-		for _, tool := range tools {
-			if tool.id == "" || tool.name == "" || !json.Valid([]byte(tool.arguments)) {
-				return nil, statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: incomplete chat tool call"}
-			}
+	for _, tool := range tools {
+		if tool.id == "" || tool.name == "" || !json.Valid([]byte(tool.arguments.String())) {
+			return nil, statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: incomplete chat tool call"}
 		}
-		message["tool_calls"] = collectedCalls(tools)
 	}
-	return json.Marshal(map[string]any{
-		"id": completionID(), "object": "chat.completion", "created": time.Now().Unix(),
-		"model":   requestedModel,
-		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finish}},
-		"usage":   usage,
-	})
+	return &parsedSSE{content: content.String(), tools: tools, finish: finish, usage: usage, chunks: events}, nil
 }
 
 // responsesConverter turns Responses SSE into OpenAI deltas incrementally.
 type responsesConverter struct {
 	indexByItem map[string]int
-	callIDs     map[string]string
-	arguments   map[string]string
-	textByPart  map[string]string
-	nextIndex   int
-	toolCalls   bool
-	content     bool
+	tools       map[int]*collectedTool
+	textByPart  map[string]*strings.Builder
+	content     strings.Builder
 	completed   bool
 	usage       map[string]any
 	err         error
@@ -745,20 +785,18 @@ type responsesConverter struct {
 
 func newResponsesConverter() *responsesConverter {
 	return &responsesConverter{
-		indexByItem: map[string]int{}, callIDs: map[string]string{}, arguments: map[string]string{}, textByPart: map[string]string{},
+		indexByItem: map[string]int{}, tools: map[int]*collectedTool{}, textByPart: map[string]*strings.Builder{},
 		usage: map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
 	}
 }
 
-func (c *responsesConverter) toolIndex(id string) int {
-	if idx, ok := c.indexByItem[id]; ok {
-		return idx
+func (c *responsesConverter) textPart(id string) *strings.Builder {
+	part := c.textByPart[id]
+	if part == nil {
+		part = &strings.Builder{}
+		c.textByPart[id] = part
 	}
-	idx := c.nextIndex
-	c.nextIndex++
-	c.indexByItem[id] = idx
-	c.toolCalls = true
-	return idx
+	return part
 }
 
 func (c *responsesConverter) convertLine(line []byte) []byte {
@@ -773,6 +811,17 @@ func (c *responsesConverter) convertLine(line []byte) []byte {
 		return nil
 	}
 	return c.convertEvent(payload)
+}
+
+// Zen appends an accounting ping after completion. Its opaque cost metadata
+// must not emit output or change the response state; reject any extra fields.
+func isResponsesCostPing(payload []byte) bool {
+	var event map[string]json.RawMessage
+	if json.Unmarshal(payload, &event) != nil || len(event) != 2 || len(event["cost"]) == 0 {
+		return false
+	}
+	var kind string
+	return json.Unmarshal(event["type"], &kind) == nil && kind == "ping"
 }
 
 func (c *responsesConverter) convertEvent(payload []byte) []byte {
@@ -812,6 +861,9 @@ func (c *responsesConverter) convertEvent(payload []byte) []byte {
 		return nil
 	}
 	if c.completed {
+		if ev.Type == "ping" && isResponsesCostPing(payload) {
+			return nil
+		}
 		c.err = statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: event after Responses completion"}
 		return nil
 	}
@@ -821,24 +873,25 @@ func (c *responsesConverter) convertEvent(payload []byte) []byte {
 		if ev.Delta == "" {
 			return nil
 		}
-		c.textByPart[part] += ev.Delta
-		c.content = true
+		c.textPart(part).WriteString(ev.Delta)
+		c.content.WriteString(ev.Delta)
 		return marshalDelta(map[string]any{"role": "assistant", "content": ev.Delta}, "", nil)
 	case "response.output_text.done":
 		if ev.Text == "" {
 			return nil
 		}
-		seen := c.textByPart[part]
+		text := c.textPart(part)
+		seen := text.String()
 		if !strings.HasPrefix(ev.Text, seen) {
 			c.err = statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: inconsistent Responses text"}
 			return nil
 		}
-		rest := strings.TrimPrefix(ev.Text, seen)
-		c.textByPart[part] = ev.Text
+		rest := ev.Text[len(seen):]
 		if rest == "" {
 			return nil
 		}
-		c.content = true
+		text.WriteString(rest)
+		c.content.WriteString(rest)
 		return marshalDelta(map[string]any{"role": "assistant", "content": rest}, "", nil)
 	case "response.output_item.added", "response.output_item.done":
 		if ev.Item == nil || ev.Item.Type != "function_call" {
@@ -850,26 +903,28 @@ func (c *responsesConverter) convertEvent(payload []byte) []byte {
 		}
 		idx, exists := c.indexByItem[ev.Item.ID]
 		if !exists {
-			idx = c.toolIndex(ev.Item.ID)
-			c.callIDs[ev.Item.ID] = ev.Item.CallID
-		} else if c.callIDs[ev.Item.ID] != ev.Item.CallID {
+			idx = len(c.indexByItem)
+			c.indexByItem[ev.Item.ID] = idx
+			c.tools[idx] = &collectedTool{id: ev.Item.CallID, name: ev.Item.Name}
+		} else if c.tools[idx].id != ev.Item.CallID {
 			c.err = statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: inconsistent Responses call id"}
 			return nil
 		}
+		tool := c.tools[idx]
 		var calls []any
 		if !exists {
 			calls = append(calls, map[string]any{"index": idx, "id": ev.Item.CallID, "type": "function", "function": map[string]any{"name": ev.Item.Name, "arguments": ""}})
 		}
 		if ev.Item.Arguments != "" {
-			seen := c.arguments[ev.Item.ID]
+			seen := tool.arguments.String()
 			if !strings.HasPrefix(ev.Item.Arguments, seen) {
 				c.err = statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: inconsistent Responses tool arguments"}
 				return nil
 			}
-			if suffix := strings.TrimPrefix(ev.Item.Arguments, seen); suffix != "" {
+			if suffix := ev.Item.Arguments[len(seen):]; suffix != "" {
 				calls = append(calls, map[string]any{"index": idx, "function": map[string]any{"arguments": suffix}})
+				tool.arguments.WriteString(suffix)
 			}
-			c.arguments[ev.Item.ID] = ev.Item.Arguments
 		}
 		if len(calls) == 0 {
 			return nil
@@ -885,18 +940,20 @@ func (c *responsesConverter) convertEvent(payload []byte) []byte {
 			c.err = statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: tool arguments before tool item"}
 			return nil
 		}
+		tool := c.tools[idx]
 		arg := ev.Delta
 		if ev.Type == "response.function_call_arguments.done" {
-			if !strings.HasPrefix(ev.Arguments, c.arguments[ev.ItemID]) {
+			seen := tool.arguments.String()
+			if !strings.HasPrefix(ev.Arguments, seen) {
 				c.err = statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: inconsistent tool arguments"}
 				return nil
 			}
-			arg = strings.TrimPrefix(ev.Arguments, c.arguments[ev.ItemID])
+			arg = ev.Arguments[len(seen):]
 		}
 		if arg == "" {
 			return nil
 		}
-		c.arguments[ev.ItemID] += arg
+		tool.arguments.WriteString(arg)
 		return marshalDelta(nil, "", []any{map[string]any{"index": idx, "function": map[string]any{"arguments": arg}}})
 	case "response.completed":
 		if c.completed || ev.Response == nil || ev.Response.Status != "completed" {
@@ -910,7 +967,7 @@ func (c *responsesConverter) convertEvent(payload []byte) []byte {
 			c.usage["total_tokens"] = ev.Response.Usage.InputTokens + ev.Response.Usage.OutputTokens
 		}
 		finish := "stop"
-		if c.toolCalls {
+		if len(c.tools) > 0 {
 			finish = "tool_calls"
 		}
 		raw, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": c.usage})
@@ -940,96 +997,42 @@ func marshalDelta(delta map[string]any, finish string, toolCalls []any) []byte {
 
 // assembleResponsesCompletion folds Responses SSE into one OpenAI completion.
 func assembleResponsesCompletion(requestedModel string, sse []byte) ([]byte, error) {
+	parsed, err := parseResponsesSSE(sse, false)
+	if err != nil {
+		return nil, err
+	}
+	return parsed.marshal(requestedModel)
+}
+
+func parseResponsesSSE(sse []byte, keepChunks bool) (*parsedSSE, error) {
 	events, _, err := sseEvents(sse)
 	if err != nil {
 		return nil, err
 	}
 	c := newResponsesConverter()
-	var content strings.Builder
-	toolArgs := map[int]string{}
-	toolNames := map[int]string{}
-	toolIDs := map[int]string{}
-	finish := ""
-	usage := c.usage
+	var chunks [][]byte
 	for _, payload := range events {
 		out := c.convertEvent(payload)
 		if c.err != nil {
 			return nil, c.err
 		}
-		if len(out) == 0 {
-			continue
-		}
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id"`
-						Function struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-					} `json:"tool_calls"`
-				} `json:"delta"`
-				FinishReason *string        `json:"finish_reason"`
-				Usage        map[string]any `json:"usage"`
-			} `json:"choices"`
-			Usage map[string]any `json:"usage"`
-		}
-		if err := json.Unmarshal(out, &chunk); err != nil {
-			return nil, statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: invalid converted Responses chunk"}
-		}
-		for _, ch := range chunk.Choices {
-			content.WriteString(ch.Delta.Content)
-			for _, tc := range ch.Delta.ToolCalls {
-				if tc.ID != "" {
-					toolIDs[tc.Index] = tc.ID
-				}
-				if tc.Function.Name != "" {
-					toolNames[tc.Index] = tc.Function.Name
-				}
-				toolArgs[tc.Index] += tc.Function.Arguments
-			}
-			if ch.FinishReason != nil && *ch.FinishReason != "" {
-				finish = *ch.FinishReason
-			}
-			for k, v := range ch.Usage {
-				usage[k] = v
-			}
-		}
-		if chunk.Usage != nil {
-			for k, v := range chunk.Usage {
-				usage[k] = v
-			}
+		if keepChunks && len(out) != 0 {
+			chunks = append(chunks, out)
 		}
 	}
-	if !c.completed || finish == "" {
+	if !c.completed {
 		return nil, statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: incomplete Responses stream"}
 	}
-	message := map[string]any{"role": "assistant", "content": content.String()}
-	if len(c.indexByItem) > 0 {
-		tools := make(map[int]*collectedTool, len(c.indexByItem))
-		for id, idx := range c.indexByItem {
-			if toolIDs[idx] == "" || toolNames[idx] == "" || !json.Valid([]byte(toolArgs[idx])) {
-				return nil, statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: incomplete Responses tool call"}
-			}
-			tools[idx] = &collectedTool{id: c.callIDs[id], name: toolNames[idx], arguments: toolArgs[idx]}
+	for _, tool := range c.tools {
+		if tool.id == "" || tool.name == "" || !json.Valid([]byte(tool.arguments.String())) {
+			return nil, statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: incomplete Responses tool call"}
 		}
-		message["tool_calls"] = collectedCalls(tools)
 	}
-	return json.Marshal(map[string]any{
-		"id":      completionID(),
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   requestedModel,
-		"choices": []any{map[string]any{
-			"index":         0,
-			"message":       message,
-			"finish_reason": finish,
-		}},
-		"usage": usage,
-	})
+	finish := "stop"
+	if len(c.tools) > 0 {
+		finish = "tool_calls"
+	}
+	return &parsedSSE{content: c.content.String(), tools: c.tools, finish: finish, usage: c.usage, chunks: chunks}, nil
 }
 
 // freeUpstreamPath maps endpoint kinds to Zen paths.
@@ -1145,83 +1148,137 @@ func fallbackEligible(ctx context.Context, err error) bool {
 	return true
 }
 
-func freeCompletion(model, endpoint string, body []byte) ([]byte, error) {
-	var mapped []byte
-	var err error
-	switch endpoint {
-	case "responses":
-		mapped, err = assembleResponsesCompletion(model, body)
-	case "systemone":
-		mapped, err = mapToCompletion(model, body)
-	default:
-		mapped, err = assembleChatCompletion(model, body)
-	}
-	if err != nil {
-		return nil, statusError{statusCode: http.StatusBadGateway, msg: err.Error()}
-	}
-	if isEmptyCompletion(mapped) {
-		return nil, statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: upstream returned no content or tools"}
-	}
-	return mapped, nil
+type freeResponse struct {
+	body    []byte
+	chunks  [][]byte
+	headers http.Header
 }
 
-// executeFree makes at most one paid-fallback decision for a free request.
-func (e *Executor) executeFree(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) (pluginapi.ExecutorResponse, error) {
+func prepareFreeResponse(model, endpoint string, body []byte, stream bool) (freeResponse, error) {
+	emptyErr := statusError{statusCode: http.StatusBadGateway, msg: "zen free executor: upstream returned no content or tools"}
+	if endpoint == "systemone" {
+		mapped, err := mapToCompletion(model, body)
+		if err != nil {
+			return freeResponse{}, err
+		}
+		if isEmptyCompletion(mapped) {
+			return freeResponse{}, emptyErr
+		}
+		if stream {
+			return freeResponse{chunks: chunkCompletion(model, mapped, framingBare)}, nil
+		}
+		return freeResponse{body: mapped}, nil
+	}
+	var parsed *parsedSSE
+	var err error
+	if endpoint == "responses" {
+		parsed, err = parseResponsesSSE(body, stream)
+	} else {
+		parsed, err = parseChatSSE(body)
+	}
+	if err != nil {
+		return freeResponse{}, err
+	}
+	if parsed.empty() {
+		return freeResponse{}, emptyErr
+	}
+	if stream {
+		return freeResponse{chunks: parsed.chunks}, nil
+	}
+	mapped, err := parsed.marshal(model)
+	return freeResponse{body: mapped}, err
+}
+
+// resolveFree owns the single fallback decision for both output modes. Parsing
+// and validation finish here; rendering never dispatches another upstream call.
+func (e *Executor) resolveFree(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry, stream bool) (freeResponse, error) {
 	body, headers, endpoint, err := e.freeCall(ctx, req, entry)
 	if err == nil {
-		body, err = freeCompletion(req.Model, endpoint, body)
-	}
-	if err == nil {
-		return pluginapi.ExecutorResponse{Payload: body, Headers: headers}, nil
+		var result freeResponse
+		result, err = prepareFreeResponse(req.Model, endpoint, body, stream)
+		if err == nil {
+			result.headers = headers
+			return result, nil
+		}
+		message := err.Error()
+		if message == sseTerminationMessage && (endpoint == "chat" || endpoint == "") &&
+			normalizeModel(entry.Alias) == "mimo-free" && e.mimoTailObserved.CompareAndSwap(false, true) {
+			message += mimoTailDetailMarker + summarizeMimoSSETailDetails(body)
+		}
+		err = statusError{statusCode: http.StatusBadGateway, msg: message}
 	}
 	if !e.cfg.Free.Quota.FailoverPaid || strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) == "" || !fallbackEligible(ctx, err) {
-		return pluginapi.ExecutorResponse{}, err
+		return freeResponse{}, err
 	}
 	paid, paidHeaders, _, fbErr := e.paidFallback(ctx, req, err)
 	if fbErr != nil {
-		return pluginapi.ExecutorResponse{}, fbErr
+		return freeResponse{}, fbErr
 	}
-	if validateCompletion(paid) != nil {
-		return pluginapi.ExecutorResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "zen paid fallback: invalid or empty completion"}
+	parsed, err := parseCompletion(paid)
+	if err != nil {
+		return freeResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "zen paid fallback: invalid or empty completion"}
 	}
-	if paidHeaders == nil {
-		paidHeaders = http.Header{}
+	result := freeResponse{body: paid, headers: paidHeaders}
+	if stream {
+		result.chunks = chunkParsedCompletion(req.Model, paid, parsed, framingBare)
+		if len(result.chunks) == 0 {
+			return freeResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "zen paid fallback: invalid or empty completion"}
+		}
+		result.body = nil
 	}
-	paidHeaders.Set(fallbackHeader, "paid")
-	return pluginapi.ExecutorResponse{Payload: paid, Headers: paidHeaders}, nil
+	if result.headers == nil {
+		result.headers = http.Header{}
+	}
+	result.headers.Set(fallbackHeader, "paid")
+	return result, nil
 }
 
-// validateCompletion rejects malformed paid JSON before it becomes a successful
-// stream (or is returned to a non-streaming caller) with invented termination.
-func validateCompletion(body []byte) error {
-	var completion struct {
-		Choices []struct {
-			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
-					ID       string `json:"id"`
-					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-				} `json:"tool_calls"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
+func (e *Executor) executeFree(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) (pluginapi.ExecutorResponse, error) {
+	result, err := e.resolveFree(ctx, req, entry, false)
+	if err != nil {
+		return pluginapi.ExecutorResponse{}, err
 	}
+	return pluginapi.ExecutorResponse{Payload: result.body, Headers: result.headers}, nil
+}
+
+type parsedCompletion struct {
+	Choices []struct {
+		Message struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+}
+
+// parseCompletion rejects malformed paid JSON and returns the decoded message
+// for stream rendering, avoiding a second full decode of long content.
+func parseCompletion(body []byte) (*parsedCompletion, error) {
+	var completion parsedCompletion
 	if err := json.Unmarshal(body, &completion); err != nil || len(completion.Choices) == 0 {
-		return fmt.Errorf("invalid chat completion")
+		return nil, fmt.Errorf("invalid chat completion")
 	}
 	choice := completion.Choices[0]
 	if choice.FinishReason == "" || strings.TrimSpace(choice.Message.Content) == "" && len(choice.Message.ToolCalls) == 0 {
-		return fmt.Errorf("empty or unfinished chat completion")
+		return nil, fmt.Errorf("empty or unfinished chat completion")
 	}
 	for _, call := range choice.Message.ToolCalls {
 		if call.ID == "" || call.Function.Name == "" || !json.Valid([]byte(call.Function.Arguments)) {
-			return fmt.Errorf("invalid chat completion tool call")
+			return nil, fmt.Errorf("invalid chat completion tool call")
 		}
 	}
-	return nil
+	return &completion, nil
+}
+
+func validateCompletion(body []byte) error {
+	_, err := parseCompletion(body)
+	return err
 }
 
 // isEmptyCompletion reports whether an assembled OpenAI completion carries
@@ -1250,81 +1307,69 @@ func isEmptyCompletion(mapped []byte) bool {
 // emitting any successful chunk, so errors and empty replies can fall back
 // without racing a previously sent finish_reason.
 func (e *Executor) executeFreeStream(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) (pluginapi.ExecutorStreamResponse, error) {
-	body, headers, endpoint, err := e.freeCall(ctx, req, entry)
-	var mapped []byte
-	if err == nil {
-		mapped, err = freeCompletion(req.Model, endpoint, body)
-	}
-	framing := framingForRequest(req)
+	result, err := e.resolveFree(ctx, req, entry, true)
 	if err != nil {
-		if !e.cfg.Free.Quota.FailoverPaid || strings.TrimSpace(e.cfg.Free.Quota.PaidFallback) == "" || !fallbackEligible(ctx, err) {
-			return pluginapi.ExecutorStreamResponse{}, err
-		}
-		paid, paidHeaders, _, fbErr := e.paidFallback(ctx, req, err)
-		if fbErr != nil {
-			return pluginapi.ExecutorStreamResponse{}, fbErr
-		}
-		pieces := chunkCompletion(req.Model, paid, framing)
-		if len(pieces) == 0 {
-			return pluginapi.ExecutorStreamResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "zen paid fallback: invalid or empty completion"}
-		}
-		if paidHeaders == nil {
-			paidHeaders = http.Header{}
-		}
-		paidHeaders.Set(fallbackHeader, "paid")
-		return pluginapi.ExecutorStreamResponse{Headers: paidHeaders, Chunks: completionChunks(ctx, pieces)}, nil
+		return pluginapi.ExecutorStreamResponse{}, err
 	}
 	if ctx.Err() != nil {
 		return pluginapi.ExecutorStreamResponse{}, ctx.Err()
 	}
-	if endpoint == "systemone" {
-		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: completionChunks(ctx, chunkCompletion(req.Model, mapped, framing))}, nil
+	return pluginapi.ExecutorStreamResponse{
+		Headers: result.headers,
+		Chunks:  completionChunks(ctx, frameChunks(result.chunks, framingForRequest(req))),
+	}, nil
+}
+
+func frameChunks(pieces [][]byte, framing streamFraming) [][]byte {
+	if framing == framingClaude {
+		for i, piece := range pieces {
+			pieces[i] = append([]byte("data: "), piece...)
+		}
 	}
-	if endpoint == "responses" {
-		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: convertResponsesSSE(ctx, body, framing)}, nil
-	}
-	return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: forwardChatSSE(ctx, body, framing)}, nil
+	return pieces
 }
 
 func completionChunks(ctx context.Context, pieces [][]byte) <-chan pluginapi.ExecutorStreamChunk {
+	// The pieces are already prepared. Enqueue them without a producer that
+	// could stay blocked if a caller stops reading without cancelling.
 	out := make(chan pluginapi.ExecutorStreamChunk, len(pieces))
-	go func() {
-		defer close(out)
-		for _, piece := range pieces {
-			if ctx.Err() != nil {
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case out <- pluginapi.ExecutorStreamChunk{Payload: piece}:
-			}
+	for _, piece := range pieces {
+		if ctx.Err() != nil {
+			break
 		}
-	}()
+		out <- pluginapi.ExecutorStreamChunk{Payload: piece}
+	}
+	close(out)
 	return out
 }
 
 // chunkCompletion splits a non-stream OpenAI completion into stream deltas.
 func chunkCompletion(model string, fbBody []byte, framing streamFraming) [][]byte {
-	if validateCompletion(fbBody) != nil {
+	decoded, err := parseCompletion(fbBody)
+	if err != nil {
 		return nil
 	}
+	return chunkParsedCompletion(model, fbBody, decoded, framing)
+}
+
+func chunkParsedCompletion(model string, body []byte, parsed *parsedCompletion, framing streamFraming) [][]byte {
+	// Reuse the validated content; read only identity, raw tools and usage.
+	// Keep identity typed against the original body, since a RawMessage of
+	// the last duplicate field would hide earlier JSON type errors.
 	var decoded struct {
 		ID      string `json:"id"`
 		Created int64  `json:"created"`
 		Choices []struct {
 			Message struct {
-				Content   string            `json:"content"`
 				ToolCalls []json.RawMessage `json:"tool_calls"`
 			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage json.RawMessage `json:"usage"`
 	}
-	if json.Unmarshal(fbBody, &decoded) != nil {
+	if json.Unmarshal(body, &decoded) != nil {
 		return nil
 	}
-	choice := decoded.Choices[0]
+	choice := parsed.Choices[0]
 	if decoded.ID == "" {
 		decoded.ID = completionID()
 	}
@@ -1362,11 +1407,12 @@ func chunkCompletion(model string, fbBody []byte, framing streamFraming) [][]byt
 		enc(map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": content[i:end]}}, nil)
 		i = end
 	}
-	if len(choice.Message.ToolCalls) != 0 {
-		calls := make([]any, 0, len(choice.Message.ToolCalls))
-		for idx, call := range choice.Message.ToolCalls {
+	tools := decoded.Choices[0].Message.ToolCalls
+	if len(tools) != 0 {
+		calls := make([]any, 0, len(tools))
+		for idx, call := range tools {
 			var obj map[string]any
-			if json.Unmarshal(call, &obj) != nil {
+			if json.Unmarshal(call, &obj) != nil || obj == nil {
 				return nil
 			}
 			obj["index"] = idx
@@ -1378,14 +1424,140 @@ func chunkCompletion(model string, fbBody []byte, framing streamFraming) [][]byt
 	return pieces
 }
 
+type freeUnavailableError struct {
+	reason  string
+	retryAt time.Time
+}
+
+func (e *freeUnavailableError) Error() string {
+	retryAt := "unknown"
+	if !e.retryAt.IsZero() {
+		retryAt = e.retryAt.UTC().Format(time.RFC3339Nano)
+	}
+	return "zen free executor: " + e.reason + "; earliest_local_retry_at=" + retryAt
+}
+
+func (*freeUnavailableError) StatusCode() int { return http.StatusServiceUnavailable }
+
+func (e *Executor) sessionlessAllowed() bool {
+	e.sessions.mu.Lock()
+	defer e.sessions.mu.Unlock()
+	return strings.TrimSpace(e.cfg.Free.SessionPool) == "" &&
+		e.sessions.loadState == sessionPoolMissing && len(e.sessions.sessions) == 0
+}
+
+func (e *Executor) sessionAvailability(now time.Time) *freeUnavailableError {
+	p := e.sessions
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.sessions) == 0 {
+		if strings.TrimSpace(e.cfg.Free.SessionPool) == "" && p.loadState == sessionPoolMissing {
+			return nil
+		}
+		reason := "session pool is empty"
+		switch p.loadState {
+		case sessionPoolMissing:
+			reason = "configured session pool is missing"
+		case sessionPoolUnreadable:
+			reason = "session pool is unreadable"
+		case sessionPoolInvalid:
+			reason = "session pool contains invalid JSON"
+		}
+		return &freeUnavailableError{reason: reason}
+	}
+	var retryAt time.Time
+	for _, s := range p.sessions {
+		if strings.TrimSpace(s.ID) == "" || s.Fails >= 5 {
+			continue
+		}
+		ready := time.Unix(s.CooldownUntil, 0)
+		if !ready.After(now) {
+			return nil
+		}
+		if retryAt.IsZero() || ready.Before(retryAt) {
+			retryAt = ready
+		}
+	}
+	return &freeUnavailableError{reason: "no eligible free session", retryAt: retryAt}
+}
+
+func (p *freePool) availability(now time.Time) *freeUnavailableError {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var retryAt time.Time
+	for _, m := range p.members {
+		if !m.cooldownUntil.After(now) {
+			return nil
+		}
+		if retryAt.IsZero() || m.cooldownUntil.Before(retryAt) {
+			retryAt = m.cooldownUntil
+		}
+	}
+	return &freeUnavailableError{reason: "no eligible free member", retryAt: retryAt}
+}
+
+// These are local snapshots, not upstream attempts: never update health here.
+// A configured paid fallback remains solely the resolver's decision.
+func (e *Executor) freeAvailability(entry FreeModelEntry) error {
+	now := time.Now()
+	var sessionErr *freeUnavailableError
+	if !strings.EqualFold(strings.TrimSpace(entry.Endpoint), "systemone") {
+		sessionErr = e.sessionAvailability(now)
+	}
+	memberErr := e.freepool.availability(now)
+	if sessionErr == nil {
+		if memberErr != nil {
+			return memberErr
+		}
+		return nil
+	}
+	if memberErr != nil {
+		sessionErr.reason += "; " + memberErr.reason
+		if sessionErr.retryAt.IsZero() || memberErr.retryAt.IsZero() {
+			sessionErr.retryAt = time.Time{}
+		} else if memberErr.retryAt.After(sessionErr.retryAt) {
+			sessionErr.retryAt = memberErr.retryAt
+		}
+	}
+	return sessionErr
+}
+
+func freeClientRestricted(err statusError) bool {
+	if err.statusCode != http.StatusForbidden {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "opencode's free tier can only be used from within opencode")
+}
+
+func freeRegionRestricted(err statusError) bool {
+	return err.statusCode == http.StatusForbidden &&
+		strings.Contains(strings.ToLower(err.Error()), "this model is not available in your country")
+}
+
 // freeCall performs member×session failover and returns one successful
 // upstream response body. Each member already couples one identity with one
 // egress, mirroring the opencode provider entries.
 func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, entry FreeModelEntry) ([]byte, http.Header, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, "", err
+	}
+	if err := e.freeAvailability(entry); err != nil {
+		return nil, nil, "", err
+	}
 	cooldown := e.cfg.cooldown()
 	var lastErr error
 	sessions := e.freeSessions(entry, req)
 	order := e.freepool.order()
+	if len(sessions) == 0 || len(order) == 0 {
+		// Another request may have cooled the last candidate since preflight.
+		if err := ctx.Err(); err != nil {
+			return nil, nil, "", err
+		}
+		if err := e.freeAvailability(entry); err != nil {
+			return nil, nil, "", err
+		}
+		return nil, nil, "", &freeUnavailableError{reason: "free pool availability changed; retry selection"}
+	}
 	attempts := 0
 	consecutive := 0
 	for _, mi := range order {
@@ -1421,13 +1593,15 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 				return nil, nil, "", err
 			}
 			if status < 200 || status >= 300 {
-				lastErr = statusError{statusCode: status, body: respBody}
+				upstreamErr := statusError{statusCode: status, body: respBody}
+				lastErr = upstreamErr
+				if freeClientRestricted(upstreamErr) || freeRegionRestricted(upstreamErr) {
+					return nil, nil, "", upstreamErr
+				}
 				if (freeRetryable(status, nil) || freeBodyRetryable(respBody)) && ctx.Err() == nil {
 					if status == http.StatusForbidden {
-						// 403 FreeTierError means this session is burned:
-						// park it for hours and keep rotating. It must NOT
-						// count toward the consecutive breaker, which is
-						// for transport-level outages.
+						// Preserve the existing penalty for unknown session
+						// rejections, excluding explicit client/region denials.
 						e.sessions.report(s, false, burnedSessionCooldown)
 						e.freepool.cool(mi, cooldown)
 						continue
@@ -1442,7 +1616,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 				return nil, nil, "", err
 			}
 			e.sessions.report(s, true, 0)
-			stampPoolSession(headers, s)
+			headers = stampPoolSession(headers, s)
 			return respBody, headers, strings.ToLower(strings.TrimSpace(entry.Endpoint)), nil
 		}
 		if attempts >= 12 {
@@ -1460,7 +1634,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 
 // freeSessions returns candidate session IDs: the interceptor-stamped
 // sticky assignment when healthy, else round-robin picks (empty for
-// systemone, which needs none). At most 3 sessions per request.
+// systemone, which needs none). At most sessionCoverage sessions per request.
 func (e *Executor) freeSessions(entry FreeModelEntry, req pluginapi.ExecutorRequest) []string {
 	if stamped := strings.TrimSpace(req.Headers.Get(poolSessionHeader)); stamped != "" {
 		if e.sessionUsable(stamped) {
@@ -1483,7 +1657,7 @@ func (e *Executor) freeSessions(entry FreeModelEntry, req pluginapi.ExecutorRequ
 		seen[s] = struct{}{}
 		out = append(out, s)
 	}
-	if len(out) == 0 {
+	if len(out) == 0 && e.sessionlessAllowed() {
 		out = append(out, "")
 	}
 	return out
@@ -1613,87 +1787,27 @@ func freeBodyRetryable(body []byte) bool {
 	return false
 }
 func forwardChatSSE(ctx context.Context, sse []byte, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
-	out := make(chan pluginapi.ExecutorStreamChunk, 8)
-	go func() {
-		defer close(out)
-		emit := func(chunk pluginapi.ExecutorStreamChunk) bool {
-			select {
-			case <-ctx.Done():
-				return false
-			case out <- chunk:
-				return true
-			}
-		}
-		mapped, err := assembleChatCompletion("", sse)
-		if err != nil {
-			emit(pluginapi.ExecutorStreamChunk{Err: err})
-			return
-		}
-		if isEmptyCompletion(mapped) {
-			return
-		}
-		events, _, err := sseEvents(sse)
-		if err != nil {
-			emit(pluginapi.ExecutorStreamChunk{Err: err})
-			return
-		}
-		for _, payload := range events {
-			if framing == framingClaude {
-				payload = append([]byte("data: "), payload...)
-			}
-			if !emit(pluginapi.ExecutorStreamChunk{Payload: payload}) {
-				return
-			}
-		}
-	}()
-	return out
+	parsed, err := parseChatSSE(sse)
+	return parsedSSEChunks(ctx, parsed, err, framing)
 }
 
-// convertResponsesSSE converts validated Responses SSE to OpenAI deltas.
-// Empty completed responses emit no success chunks; executeFreeStream checks
-// for emptiness before selecting the single paid fallback.
+// convertResponsesSSE emits no success chunks for empty or invalid responses.
 func convertResponsesSSE(ctx context.Context, sse []byte, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
-	out := make(chan pluginapi.ExecutorStreamChunk, 8)
-	go func() {
-		defer close(out)
-		emit := func(chunk pluginapi.ExecutorStreamChunk) bool {
-			select {
-			case <-ctx.Done():
-				return false
-			case out <- chunk:
-				return true
-			}
+	parsed, err := parseResponsesSSE(sse, true)
+	return parsedSSEChunks(ctx, parsed, err, framing)
+}
+
+func parsedSSEChunks(ctx context.Context, parsed *parsedSSE, err error, framing streamFraming) <-chan pluginapi.ExecutorStreamChunk {
+	if err != nil {
+		out := make(chan pluginapi.ExecutorStreamChunk, 1)
+		if ctx.Err() == nil {
+			out <- pluginapi.ExecutorStreamChunk{Err: err}
 		}
-		mapped, err := assembleResponsesCompletion("", sse)
-		if err != nil {
-			emit(pluginapi.ExecutorStreamChunk{Err: err})
-			return
-		}
-		if isEmptyCompletion(mapped) {
-			return
-		}
-		events, _, err := sseEvents(sse)
-		if err != nil {
-			emit(pluginapi.ExecutorStreamChunk{Err: err})
-			return
-		}
-		c := newResponsesConverter()
-		for _, payload := range events {
-			chunk := c.convertEvent(payload)
-			if c.err != nil {
-				emit(pluginapi.ExecutorStreamChunk{Err: c.err})
-				return
-			}
-			if len(chunk) == 0 {
-				continue
-			}
-			if framing == framingClaude {
-				chunk = append([]byte("data: "), chunk...)
-			}
-			if !emit(pluginapi.ExecutorStreamChunk{Payload: chunk}) {
-				return
-			}
-		}
-	}()
-	return out
+		close(out)
+		return out
+	}
+	if parsed.empty() {
+		return completionChunks(ctx, nil)
+	}
+	return completionChunks(ctx, frameChunks(parsed.chunks, framing))
 }

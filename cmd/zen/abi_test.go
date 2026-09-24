@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -87,6 +88,22 @@ func TestWrappedStatusPreserved(t *testing.T) {
 	raw := abiErrorEnvelopeFromError("plugin_error", fmt.Errorf("wrapped: %w", testStatusError(429)))
 	if !bytes.Contains(raw, []byte(`"http_status":429`)) {
 		t.Fatalf("wrapped status lost: %s", raw)
+	}
+	const marker = "earliest_local_retry_at=unknown"
+	raw = abiErrorEnvelopeFromError("plugin_error", fmt.Errorf("zen free executor: %s: %w", marker, testStatusError(503)))
+	var envelope struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code       string `json:"code"`
+			Message    string `json:"message"`
+			HTTPStatus int    `json:"http_status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.OK || envelope.Error.Code != "plugin_error" || envelope.Error.HTTPStatus != 503 || !bytes.Contains([]byte(envelope.Error.Message), []byte(marker)) {
+		t.Fatalf("local 503 status/message lost: %s", raw)
 	}
 }
 
