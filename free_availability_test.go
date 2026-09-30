@@ -222,7 +222,60 @@ func availabilityExpectUnknownRetry(t *testing.T, err error) {
 	}
 }
 
-func TestFreeAvailabilityPolicy403FailsFastWithoutCooling(t *testing.T) {
+func TestFreeAvailabilityPolicy403FailsOverToHealthyMember(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			poolPath := availabilityPoolFile(t, availabilitySessions(t, 2, 0, 0))
+			e := availabilityExecutor(poolPath, false)
+			beforeSessions, _ := availabilityHealth(e)
+			calls := 0
+			fake := &freeFixFakeHTTP{answer: func(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+				if !strings.HasSuffix(req.URL, "/v1/responses") {
+					t.Error("policy 403 dispatched a paid or wrong-endpoint request")
+				}
+				calls++
+				if calls == 1 {
+					return pluginapi.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(`{"error":{"message":"Error from provider (Console): ` + availabilityGate + `"}}`)}, nil
+				}
+				return availabilityFreeSuccess(req), nil
+			}}
+			if marker := availabilityResponse(t, e, freeFixRequest(fake), stream, "Recovered").Get(fallbackHeader); marker != "" {
+				t.Fatal("free member failover must not use paid fallback")
+			}
+			got := fake.snapshot()
+			if len(got) != 2 {
+				t.Fatalf("rejected member must fail over to the next one, got %d calls", len(got))
+			}
+			for _, c := range got {
+				if !strings.HasSuffix(c.URL, "/v1/responses") || c.Headers.Get("X-Opencode-Session") == "" {
+					t.Fatal("failover must reuse the responses endpoint with a session")
+				}
+			}
+			afterSessions, afterMembers := availabilityHealth(e)
+			if !reflect.DeepEqual(afterSessions, beforeSessions) {
+				t.Fatal("policy failover must not penalize sessions")
+			}
+			cooled := 0
+			for _, m := range afterMembers {
+				switch m.fails {
+				case 1:
+					cooled++
+					if !m.until.After(time.Now().Add(time.Hour)) {
+						t.Fatal("policy-denied member must cool long, not 300s")
+					}
+				case 0:
+				default:
+					t.Fatalf("unexpected member health: %+v", m)
+				}
+			}
+			if cooled != 1 {
+				t.Fatalf("exactly one rejected member must cool, got %d", cooled)
+			}
+		})
+	}
+}
+
+func TestFreeAvailabilityPolicy403AllBlockedPreservesLastResort(t *testing.T) {
 	// JSON bodies below are synthetic fixtures, not recorded upstream payloads.
 	gateBodies := []struct {
 		name, body string
@@ -238,7 +291,7 @@ func TestFreeAvailabilityPolicy403FailsFastWithoutCooling(t *testing.T) {
 				poolPath := availabilityPoolFile(t, availabilitySessions(t, 2, 0, 0))
 				e := availabilityExecutor(poolPath, false)
 				beforeFile := availabilitySnapshotFile(t, poolPath)
-				beforeSessions, beforeMembers := availabilityHealth(e)
+				beforeSessions, _ := availabilityHealth(e)
 				fake := &freeFixFakeHTTP{answer: func(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 					if !strings.HasSuffix(req.URL, "/v1/responses") {
 						t.Error("policy 403 dispatched a paid or wrong-endpoint request")
@@ -251,10 +304,35 @@ func TestFreeAvailabilityPolicy403FailsFastWithoutCooling(t *testing.T) {
 					t.Fatal("original gate message must be returned with status 403")
 				}
 				calls := fake.snapshot()
-				if len(calls) != 1 || !strings.HasSuffix(calls[0].URL, "/v1/responses") || calls[0].Headers.Get("X-Opencode-Session") == "" {
-					t.Fatalf("policy 403 must stop after one session/member free call, got %d calls", len(calls))
+				if len(calls) != 2 {
+					t.Fatalf("all-blocked pool must try every member once, got %d calls", len(calls))
 				}
-				availabilityHealthUnchanged(t, e, beforeSessions, beforeMembers)
+				for _, c := range calls {
+					if !strings.HasSuffix(c.URL, "/v1/responses") || c.Headers.Get("X-Opencode-Session") == "" {
+						t.Fatal("failover must stay on responses with a session")
+					}
+				}
+				afterSessions, afterMembers := availabilityHealth(e)
+				if !reflect.DeepEqual(afterSessions, beforeSessions) {
+					t.Fatal("policy denial must not penalize sessions")
+				}
+				cooled, pristine := 0, 0
+				for _, m := range afterMembers {
+					switch m.fails {
+					case 1:
+						cooled++
+						if !m.until.After(time.Now().Add(time.Hour)) {
+							t.Fatal("policy-denied member must cool long, not 300s")
+						}
+					case 0:
+						pristine++
+					default:
+						t.Fatalf("unexpected member health: %+v", m)
+					}
+				}
+				if cooled != 1 || pristine != 1 {
+					t.Fatalf("last-resort member must stay uncooled, got cooled=%d pristine=%d", cooled, pristine)
+				}
 				availabilityFileUnchanged(t, poolPath, beforeFile)
 			})
 		}
@@ -267,7 +345,7 @@ func TestFreeAvailabilityPolicy403ExplicitPaidFallbackOnce(t *testing.T) {
 			poolPath := availabilityPoolFile(t, availabilitySessions(t, 2, 0, 0))
 			e := availabilityExecutor(poolPath, true)
 			beforeFile := availabilitySnapshotFile(t, poolPath)
-			beforeSessions, beforeMembers := availabilityHealth(e)
+			beforeSessions, _ := availabilityHealth(e)
 			fake := &freeFixFakeHTTP{answer: func(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 				if strings.HasSuffix(req.URL, "/v1/responses") {
 					return pluginapi.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(`{"error":{"message":"` + availabilityGate + `"}}`)}, nil
@@ -281,10 +359,30 @@ func TestFreeAvailabilityPolicy403ExplicitPaidFallbackOnce(t *testing.T) {
 				t.Fatal("explicit paid fallback must mark its response")
 			}
 			calls := fake.snapshot()
-			if len(calls) != 2 || !strings.HasSuffix(calls[0].URL, "/v1/responses") || !strings.HasSuffix(calls[1].URL, "/v1/chat/completions") {
-				t.Fatalf("policy 403 must make one free call and one paid resolver call, got %d", len(calls))
+			if len(calls) != 3 || !strings.HasSuffix(calls[0].URL, "/v1/responses") || !strings.HasSuffix(calls[1].URL, "/v1/responses") || !strings.HasSuffix(calls[2].URL, "/v1/chat/completions") {
+				t.Fatalf("policy 403 must try every free member then one paid resolver call, got %d", len(calls))
 			}
-			availabilityHealthUnchanged(t, e, beforeSessions, beforeMembers)
+			afterSessions, afterMembers := availabilityHealth(e)
+			if !reflect.DeepEqual(afterSessions, beforeSessions) {
+				t.Fatal("policy denial must not penalize sessions")
+			}
+			cooled, pristine := 0, 0
+			for _, m := range afterMembers {
+				switch m.fails {
+				case 1:
+					cooled++
+					if !m.until.After(time.Now().Add(time.Hour)) {
+						t.Fatal("policy-denied member must cool long, not 300s")
+					}
+				case 0:
+					pristine++
+				default:
+					t.Fatalf("unexpected member health: %+v", m)
+				}
+			}
+			if cooled != 1 || pristine != 1 {
+				t.Fatalf("last-resort member must stay uncooled, got cooled=%d pristine=%d", cooled, pristine)
+			}
 			availabilityFileUnchanged(t, poolPath, beforeFile)
 		})
 	}

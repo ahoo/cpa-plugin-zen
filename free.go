@@ -256,10 +256,17 @@ type freePool struct {
 	rnd     *lockedRand
 	members []freeLiveMember
 	clients map[int]*http.Client
+	// preferred remembers the last-good member per pool session so steady
+	// traffic reuses one egress instead of rolling the dice every time.
+	// Entries are dropped as soon as their member cools; the map is
+	// best-effort rotation state, never persisted.
+	preferred map[string]int
+	// timeoutSec bounds one upstream attempt (connect through full body).
+	timeoutSec int
 }
 
 func newFreePool(cfg *pluginConfig) *freePool {
-	p := &freePool{rnd: &lockedRand{}, clients: map[int]*http.Client{}}
+	p := &freePool{rnd: &lockedRand{}, clients: map[int]*http.Client{}, preferred: map[string]int{}}
 	if cfg == nil {
 		return p
 	}
@@ -269,7 +276,51 @@ func newFreePool(cfg *pluginConfig) *freePool {
 		}
 		p.members = append(p.members, freeLiveMember{key: en.authKey(), url: strings.TrimSpace(en.ProxyURL), weight: en.normWeight(), idx: i})
 	}
+	p.timeoutSec = cfg.attemptTimeout()
 	return p
+}
+
+// preferFirst moves the session's last-good member to the front of this
+// request's failover order. Unknown sessions, missing or already-cooled
+// members keep the random order untouched.
+func (p *freePool) preferFirst(session string, order []int) []int {
+	if strings.TrimSpace(session) == "" || len(order) < 2 {
+		return order
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	want, ok := p.preferred[session]
+	if !ok {
+		return order
+	}
+	pos := -1
+	for i, mi := range order {
+		if mi == want {
+			pos = i
+			break
+		}
+	}
+	if pos <= 0 {
+		return order
+	}
+	out := make([]int, 0, len(order))
+	out = append(out, want)
+	out = append(out, order[:pos]...)
+	out = append(out, order[pos+1:]...)
+	return out
+}
+
+// remember pins the session to the member that just served it.
+func (p *freePool) remember(session string, idx int) {
+	if strings.TrimSpace(session) == "" || idx < 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.preferred == nil {
+		p.preferred = map[string]int{}
+	}
+	p.preferred[session] = idx
 }
 
 // order returns member indices in weighted-random order, skipping cooled
@@ -316,6 +367,13 @@ func (p *freePool) cool(idx int, cooldownSec int) {
 		p.members[idx].cooldownUntil = time.Now().Add(time.Duration(cooldownSec) * time.Second)
 		p.members[idx].fails++
 	}
+	// A cooled member is unavailable: drop stickiness pointing at it so
+	// the next request rediscovers instead of preferring a dead egress.
+	for s, mi := range p.preferred {
+		if mi == idx {
+			delete(p.preferred, s)
+		}
+	}
 }
 
 func (p *freePool) clientFor(idx int, hostClient pluginapi.HostHTTPClient) (doer, error) {
@@ -341,7 +399,11 @@ func (p *freePool) clientFor(idx int, hostClient pluginapi.HostHTTPClient) (doer
 	if err != nil {
 		return nil, err
 	}
-	c := &http.Client{Transport: transport, Timeout: 20 * time.Second}
+	timeout := p.timeoutSec
+	if timeout <= 0 {
+		timeout = 120
+	}
+	c := &http.Client{Transport: transport, Timeout: time.Duration(timeout) * time.Second}
 	p.clients[idx] = c
 	return stdDoer{client: c}, nil
 }
@@ -1138,7 +1200,12 @@ func mergeTools(existing []any, cloak []map[string]any, minTools int) []any {
 }
 
 func fallbackEligible(ctx context.Context, err error) bool {
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// A cancelled downstream must stop immediately. Any other failure -
+	// including our own attempt timeout with a still-live context - may
+	// fail over: only a dead caller makes retry pointless. (Host-side
+	// deadlines surface as ctx errors and are caught by the first two
+	// checks, so reaching the pool means our own timeout fired.)
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false
 	}
 	var upstream statusError
@@ -1548,6 +1615,12 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 	var lastErr error
 	sessions := e.freeSessions(entry, req)
 	order := e.freepool.order()
+	// Session-sticky member: a conversation that already found a working
+	// egress reuses it first and only pays discovery again when that
+	// member cools. The rest of the order stays as failover.
+	if len(sessions) > 0 {
+		order = e.freepool.preferFirst(sessions[0], order)
+	}
 	if len(sessions) == 0 || len(order) == 0 {
 		// Another request may have cooled the last candidate since preflight.
 		if err := ctx.Err(); err != nil {
@@ -1560,7 +1633,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 	}
 	attempts := 0
 	consecutive := 0
-	for _, mi := range order {
+	for pos, mi := range order {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, "", err
 		}
@@ -1596,7 +1669,19 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 				upstreamErr := statusError{statusCode: status, body: respBody}
 				lastErr = upstreamErr
 				if freeClientRestricted(upstreamErr) || freeRegionRestricted(upstreamErr) {
-					return nil, nil, "", upstreamErr
+					// Explicit client/region denials are per (model, member):
+					// the session itself is healthy, but this member's key or
+					// egress cannot serve the model right now. Cool the member
+					// with the long policy cooldown (these bans are
+					// deterministic, not transient) and fail over to the next
+					// member immediately instead of surfacing the first
+					// rejected pick. As a last resort (no alternative member
+					// left) preserve the original 403 without mutating pool
+					// health, so single-member setups keep working.
+					if pos < len(order)-1 {
+						e.freepool.cool(mi, e.cfg.policyCooldown())
+					}
+					break
 				}
 				if (freeRetryable(status, nil) || freeBodyRetryable(respBody)) && ctx.Err() == nil {
 					if status == http.StatusForbidden {
@@ -1616,6 +1701,7 @@ func (e *Executor) freeCall(ctx context.Context, req pluginapi.ExecutorRequest, 
 				return nil, nil, "", err
 			}
 			e.sessions.report(s, true, 0)
+			e.freepool.remember(s, mi)
 			headers = stampPoolSession(headers, s)
 			return respBody, headers, strings.ToLower(strings.TrimSpace(entry.Endpoint)), nil
 		}

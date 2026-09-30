@@ -187,9 +187,19 @@ type cloakConfig struct {
 
 // quotaConfig governs free-pool cooldown and paid fallback.
 type quotaConfig struct {
-	Cooldown     int    `yaml:"cooldown"` // seconds a failed member/session cools down
-	FailoverPaid bool   `yaml:"failover_paid"`
-	PaidFallback string `yaml:"paid_fallback"` // paid model alias used when free is exhausted
+	Cooldown int `yaml:"cooldown"` // seconds a failed member/session cools down
+	// PolicyCooldown is the seconds a member cools down after an explicit
+	// upstream policy denial (country ban or free-tier client gate). Those
+	// bans are deterministic and long-lived: re-probing every Cooldown
+	// just burns an upstream round trip on every request. Default 21600.
+	PolicyCooldown int `yaml:"policy_cooldown"`
+	// AttemptTimeout bounds one free upstream attempt (connect through full
+	// body read) in seconds. Free-tier streams for large prompts can take a
+	// minute or more; the old 20s killed legitimate slow streams with no
+	// retry. Default 120.
+	AttemptTimeout int    `yaml:"attempt_timeout"`
+	FailoverPaid   bool   `yaml:"failover_paid"`
+	PaidFallback   string `yaml:"paid_fallback"` // paid model alias used when free is exhausted
 	// FallbackMinTokens floors the output budget on fallback calls: tiny
 	// budgets burn out on thinking models and return empty. Default 512.
 	FallbackMinTokens int `yaml:"fallback_min_tokens"`
@@ -207,6 +217,25 @@ func (c *pluginConfig) cooldown() int {
 		return c.Free.Quota.Cooldown
 	}
 	return 300
+}
+
+// policyCooldown is the member cooldown after an explicit upstream policy
+// denial. Defaults to 21600 (6h): country bans and rejected keys do not
+// clear in minutes, so the normal short cooldown would re-probe them on
+// nearly every request.
+func (c *pluginConfig) policyCooldown() int {
+	if c != nil && c.Free.Quota.PolicyCooldown > 0 {
+		return c.Free.Quota.PolicyCooldown
+	}
+	return 21600
+}
+
+// attemptTimeout bounds one free upstream attempt in seconds.
+func (c *pluginConfig) attemptTimeout() int {
+	if c != nil && c.Free.Quota.AttemptTimeout > 0 {
+		return c.Free.Quota.AttemptTimeout
+	}
+	return 120
 }
 
 func (en APIKeyEntry) normWeight() int {

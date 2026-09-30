@@ -125,14 +125,26 @@ building and deploying are separate operations.
   Upstream/fallback errors are returned as errors, not synthetic successful
   `stop` frames. Empty-result detection ignores role/usage-only frames.
 - HTTP 403 with the explicit message `OpenCode's free tier can only be used from
-  within OpenCode` ends free attempts immediately. It does not penalize sessions
-  or members, rotate through the pool, or become an empty successful completion.
-  The explicit geographic denial `This model is not available in your country`
-  has the same health-neutral, single-free-attempt behavior. Console wrapping
-  and letter case are accepted; unknown 403 and 429 retain their existing
-  handling. Neither denial proves a session is bad, and returning it does not
-  remove the upstream restriction. Explicitly configured paid fallback retains
-  its separate resolver contract; no denial enables it automatically.
+  within OpenCode` and the explicit geographic denial
+  `This model is not available in your country` are per (model, member):
+  the rejected member cools and the request fails over to the next member
+  with the same session, without penalizing the session. Only as a last
+  resort (no alternative member left) is the original 403 preserved without
+  mutating pool health, so single-member setups keep working. Rejected
+  members cool for `free.quota.policy_cooldown` seconds (default 21600):
+  country bans and rejected keys are deterministic, so the short transient
+  `cooldown` would just re-probe them on nearly every request. Steady
+  traffic reuses the session's last-good member first
+  (`freePool.preferFirst`/`remember`, dropped on cool) and only pays
+  discovery again when that egress cools; single-member setups are
+  unaffected. One attempt is bounded by `free.quota.attempt_timeout`
+  seconds (default 120): with a live caller, an attempt timeout fails over
+  to the next member instead of ending the request, and three straight
+  failures still abort to paid fallback handling. Console
+  wrapping and letter case are accepted; unknown 403 and 429 retain their
+  existing handling. Neither denial proves a session is bad.
+  Explicitly configured paid fallback retains its separate resolver contract;
+  no denial enables it automatically.
 - Chat/Responses with an unavailable session pool, or any free endpoint with no
   eligible member, fail locally with HTTP 503 before upstream dispatch. This
   neither rewrites the pool nor extends cooldowns. `earliest_local_retry_at` in

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -135,7 +136,61 @@ func geoDiagnosticAssertSummary(t *testing.T, err error, want bool) {
 	}
 }
 
-func TestFreeGeoCountry403StopsWithoutMutatingHealth(t *testing.T) {
+func TestFreeGeoCountryCoolsBlockedEgressAndFailsOver(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			path := availabilityPoolFile(t, availabilitySessions(t, 2, 0, 0))
+			e := geoDiagnosticExecutor(t, path, false, "chat")
+			geoDiagnosticSeedAvailableHealth(e)
+			beforeSessions, _ := availabilityHealth(e)
+			calls := 0
+			fake := &freeFixFakeHTTP{answer: func(_ context.Context, request pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+				if !strings.HasSuffix(request.URL, "/v1/responses") {
+					t.Fatal("muse-free failover must stay on the responses endpoint")
+				}
+				calls++
+				if calls == 1 {
+					return pluginapi.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(geoDiagnosticCountry)}, nil
+				}
+				return availabilityFreeSuccess(request), nil
+			}}
+			if marker := availabilityResponse(t, e, geoDiagnosticRequest(fake, "muse-free"), stream, "Recovered").Get(fallbackHeader); marker != "" {
+				t.Fatal("free egress failover must not use paid fallback")
+			}
+			got := fake.snapshot()
+			if len(got) != 2 {
+				t.Fatalf("blocked egress must fail over to the next member, got %d calls", len(got))
+			}
+			for _, c := range got {
+				if !strings.HasSuffix(c.URL, "/v1/responses") || c.Headers.Get("X-Opencode-Session") == "" {
+					t.Fatal("failover must reuse the responses endpoint with a session")
+				}
+			}
+			afterSessions, afterMembers := availabilityHealth(e)
+			if !reflect.DeepEqual(afterSessions, beforeSessions) {
+				t.Fatal("geographic failover must not penalize sessions")
+			}
+			cooled := 0
+			for _, m := range afterMembers {
+				switch m.fails {
+				case 3:
+					cooled++
+					if !m.until.After(time.Now().Add(time.Hour)) {
+						t.Fatal("policy-denied member must cool long, not 300s")
+					}
+				case 2:
+				default:
+					t.Fatalf("unexpected member health: %+v", m)
+				}
+			}
+			if cooled != 1 {
+				t.Fatalf("exactly one blocked egress must cool, got %d", cooled)
+			}
+		})
+	}
+}
+
+func TestFreeGeoCountryAllBlockedPreservesLastResort(t *testing.T) {
 	cases := []struct{ name, body string }{
 		{"plain", geoDiagnosticCountry},
 		{"console-prefix", "Error from provider (Console): RegionError: " + geoDiagnosticCountry},
@@ -149,7 +204,7 @@ func TestFreeGeoCountry403StopsWithoutMutatingHealth(t *testing.T) {
 				e := geoDiagnosticExecutor(t, path, false, "chat")
 				geoDiagnosticSeedAvailableHealth(e)
 				beforeDisk := availabilitySnapshotFile(t, path)
-				beforeSessions, beforeMembers := availabilityHealth(e)
+				beforeSessions, _ := availabilityHealth(e)
 				fake := &freeFixFakeHTTP{answer: func(_ context.Context, request pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 					return pluginapi.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(tc.body)}, nil
 				}}
@@ -159,10 +214,35 @@ func TestFreeGeoCountry403StopsWithoutMutatingHealth(t *testing.T) {
 					t.Fatal("must return the original country-restriction message")
 				}
 				calls := fake.snapshot()
-				if len(calls) != 1 || !strings.HasSuffix(calls[0].URL, "/v1/responses") || calls[0].Headers.Get("X-Opencode-Session") == "" {
-					t.Fatalf("country restriction must stop after one free request, got %d calls", len(calls))
+				if len(calls) != 2 {
+					t.Fatalf("all-blocked pool must try every egress once, got %d calls", len(calls))
 				}
-				availabilityHealthUnchanged(t, e, beforeSessions, beforeMembers)
+				for _, c := range calls {
+					if !strings.HasSuffix(c.URL, "/v1/responses") || c.Headers.Get("X-Opencode-Session") == "" {
+						t.Fatal("failover must stay on responses with a session")
+					}
+				}
+				afterSessions, afterMembers := availabilityHealth(e)
+				if !reflect.DeepEqual(afterSessions, beforeSessions) {
+					t.Fatal("geographic denial must not penalize sessions")
+				}
+				cooled, pristine := 0, 0
+				for _, m := range afterMembers {
+					switch m.fails {
+					case 3:
+						cooled++
+						if !m.until.After(time.Now().Add(time.Hour)) {
+							t.Fatal("policy-denied member must cool long, not 300s")
+						}
+					case 2:
+						pristine++
+					default:
+						t.Fatalf("unexpected member health: %+v", m)
+					}
+				}
+				if cooled != 1 || pristine != 1 {
+					t.Fatalf("last-resort egress must stay uncooled, got cooled=%d pristine=%d", cooled, pristine)
+				}
 				availabilityFileUnchanged(t, path, beforeDisk)
 			})
 		}
@@ -176,7 +256,7 @@ func TestFreeGeoExplicitPaidFallbackKeepsOneSequence(t *testing.T) {
 			e := geoDiagnosticExecutor(t, path, true, "chat")
 			geoDiagnosticSeedAvailableHealth(e)
 			beforeDisk := availabilitySnapshotFile(t, path)
-			beforeSessions, beforeMembers := availabilityHealth(e)
+			beforeSessions, _ := availabilityHealth(e)
 			fake := &freeFixFakeHTTP{answer: func(_ context.Context, request pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 				if strings.HasSuffix(request.URL, "/v1/responses") {
 					return pluginapi.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(`{"error":{"message":"` + geoDiagnosticCountry + `"}}`)}, nil
@@ -190,10 +270,30 @@ func TestFreeGeoExplicitPaidFallbackKeepsOneSequence(t *testing.T) {
 				t.Fatal("explicit paid fallback must mark its response")
 			}
 			calls := fake.snapshot()
-			if len(calls) != 2 || !strings.HasSuffix(calls[0].URL, "/v1/responses") || !strings.HasSuffix(calls[1].URL, "/v1/chat/completions") {
-				t.Fatalf("expected one free request and one paid resolver call, got %d", len(calls))
+			if len(calls) != 3 || !strings.HasSuffix(calls[0].URL, "/v1/responses") || !strings.HasSuffix(calls[1].URL, "/v1/responses") || !strings.HasSuffix(calls[2].URL, "/v1/chat/completions") {
+				t.Fatalf("expected two free egress attempts then one paid resolver call, got %d", len(calls))
 			}
-			availabilityHealthUnchanged(t, e, beforeSessions, beforeMembers)
+			afterSessions, afterMembers := availabilityHealth(e)
+			if !reflect.DeepEqual(afterSessions, beforeSessions) {
+				t.Fatal("geographic denial must not penalize sessions")
+			}
+			cooled, pristine := 0, 0
+			for _, m := range afterMembers {
+				switch m.fails {
+				case 3:
+					cooled++
+					if !m.until.After(time.Now().Add(time.Hour)) {
+						t.Fatal("policy-denied member must cool long, not 300s")
+					}
+				case 2:
+					pristine++
+				default:
+					t.Fatalf("unexpected member health: %+v", m)
+				}
+			}
+			if cooled != 1 || pristine != 1 {
+				t.Fatalf("last-resort egress must stay uncooled, got cooled=%d pristine=%d", cooled, pristine)
+			}
 			availabilityFileUnchanged(t, path, beforeDisk)
 		})
 	}
